@@ -1,18 +1,15 @@
 # %%
 import argparse
 import os
-import numpy as np
-import math
+import pkbar
 
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 
-from torch.utils.data import DataLoader
 from torchvision import datasets
 from torch.autograd import Variable
 
 import torch.nn as nn
-import torch.nn.functional as F
 import torch
 
 os.makedirs("images", exist_ok=True)
@@ -32,8 +29,8 @@ os.makedirs("images", exist_ok=True)
 # print(opt)
 
 opt = argparse.Namespace(
-    n_epochs=200,
-    batch_size=64,
+    n_epochs=100,
+    batch_size=128,
     lr=2e-4,
     b1=0.5,
     b2=0.999,
@@ -44,7 +41,7 @@ opt = argparse.Namespace(
     sample_interval=400
 )
 
-cuda = True if torch.cuda.is_available() else False
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def weights_init_normal(m):
@@ -54,6 +51,11 @@ def weights_init_normal(m):
     elif classname.find("BatchNorm2d") != -1:
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
+
+
+def reparametrization(mu, log_sigma):
+    sigma = torch.exp(log_sigma)
+    return mu + torch.randn_like(mu) * sigma    
 
 
 class Generator(nn.Module):
@@ -84,33 +86,83 @@ class Generator(nn.Module):
         return img
 
 
-class Discriminator(nn.Module):
+class DiscriminatorXZ(nn.Module):
     def __init__(self):
-        super(Discriminator, self).__init__()
+        super(DiscriminatorXZ, self).__init__()
 
-        def discriminator_block(in_filters, out_filters, bn=True):
-            block = [nn.Conv2d(in_filters, out_filters, 3, 2, 1), nn.LeakyReLU(0.2, inplace=True), nn.Dropout2d(0.25)]
+        def discriminator_block(in_filters, out_filters, kernel_size=3, stride=2, padding=1,
+                bn=True, dropout=0.25, relu_slope=0.2, bn_eps=0.8):
+            block = [
+                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding), 
+                nn.LeakyReLU(relu_slope, inplace=True), 
+                nn.Dropout2d(dropout)
+            ]
             if bn:
-                block.append(nn.BatchNorm2d(out_filters, 0.8))
+                block.append(nn.BatchNorm2d(out_filters, bn_eps))
             return block
 
-        self.model = nn.Sequential(
+        self.x_block = nn.Sequential(
             *discriminator_block(opt.channels, 16, bn=False),
             *discriminator_block(16, 32),
             *discriminator_block(32, 64),
             *discriminator_block(64, 128),
+            *discriminator_block(128, 256),
+            *discriminator_block(256, 512),
+        )
+        self.z_block = nn.Sequential(
+            *discriminator_block(opt.latent_dim, 512, bn=False),
+            *discriminator_block(512, 512, bn=False),
+        )
+        self.joint_block = nn.Sequential(
+            *discriminator_block(1024, 1024, bn=False),
+            *discriminator_block(1024, 1024, bn=False),
+        )
+        self.adv_layer = nn.Sequential(
+            nn.Linear(1024, 1),
+            # nn.Conv2d(1024, 1, 1, stride=1, bias=True), 
+            nn.Sigmoid()
         )
 
-        # The height and width of downsampled image
-        ds_size = opt.img_size // 2 ** 4
-        self.adv_layer = nn.Sequential(nn.Linear(128 * ds_size ** 2, 1), nn.Sigmoid())
-
-    def forward(self, img):
-        out = self.model(img)
+    def forward(self, x, z):
+        x_repr = self.x_block(x)
+        z_repr = self.z_block(z.view(*z.shape, 1, 1))
+        joint_repr = torch.cat([x_repr, z_repr], dim=1)
+        out = self.joint_block(joint_repr)
         out = out.view(out.shape[0], -1)
         validity = self.adv_layer(out)
 
         return validity
+
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+
+        def encoder_block(in_filters, out_filters, kernel_size=5, stride=1, padding=0,
+                relu_slope=0.01, bn_eps=1e-5):
+            block = [
+                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding), 
+                nn.BatchNorm2d(out_filters, bn_eps),
+                nn.LeakyReLU(relu_slope, inplace=True), 
+            ]
+            return block
+
+        self.model = nn.Sequential(
+            *encoder_block(opt.channels, 32, kernel_size=5, stride=1),
+            *encoder_block(32, 64, kernel_size=4, stride=2),
+            *encoder_block(64, 128, kernel_size=4, stride=1),
+            *encoder_block(128, 256, kernel_size=4, stride=2),
+            *encoder_block(256, 512, kernel_size=4, stride=1),
+            *encoder_block(512, 512, kernel_size=1, stride=1),
+            # 2 * latent = (mu, sigma)
+            *encoder_block(512, 2 * opt.latent_dim, kernel_size=1, stride=1),
+            # *encoder_block(512, opt.latent_dim, kernel_size=1, stride=1),
+            nn.Flatten()
+        )
+
+    def forward(self, x):
+        out = self.model(x)
+        return out
 
 
 # Loss function
@@ -118,15 +170,17 @@ adversarial_loss = torch.nn.BCELoss()
 
 # Initialize generator and discriminator
 generator = Generator()
-discriminator = Discriminator()
+encoder = Encoder()
+discriminator = DiscriminatorXZ()
 
-if cuda:
-    generator.cuda()
-    discriminator.cuda()
-    adversarial_loss.cuda()
+generator.to(device)
+encoder.to(device)
+discriminator.to(device)
+adversarial_loss.to(device)
 
 # Initialize weights
 generator.apply(weights_init_normal)
+encoder.apply(weights_init_normal)
 discriminator.apply(weights_init_normal)
 
 # Configure data loader
@@ -145,42 +199,56 @@ dataloader = torch.utils.data.DataLoader(
 )
 
 # Optimizers
-optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+optimizer_GE = torch.optim.Adam([*generator.parameters(), *encoder.parameters()], lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
-
-Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
 # ----------
 #  Training
 # ----------
 
 for epoch in range(opt.n_epochs):
+    kbar = pkbar.Kbar(target=len(dataloader), epoch=epoch, num_epochs=opt.n_epochs, width=8, always_stateful=False)
     for i, (imgs, _) in enumerate(dataloader):
 
         # Adversarial ground truths
-        valid = Variable(Tensor(imgs.shape[0], 1).fill_(1.0), requires_grad=False)
-        fake = Variable(Tensor(imgs.shape[0], 1).fill_(0.0), requires_grad=False)
+        label_real = Variable(torch.ones((imgs.shape[0], 1)).to(device), requires_grad=False)
+        label_fake = Variable(torch.zeros((imgs.shape[0], 1)).to(device), requires_grad=False)
 
         # Configure input
-        real_imgs = Variable(imgs.type(Tensor))
+        imgs_real = Variable(imgs.float().to(device))
+
+        # Prepare discriminator noise
+        noise_real = torch.normal(0, 0.1 * (opt.n_epochs - epoch) / opt.n_epochs, imgs_real.shape).to(device)
+        noise_fake = torch.normal(0, 0.1 * (opt.n_epochs - epoch) / opt.n_epochs, imgs_real.shape).to(device)
 
         # -----------------
         #  Train Generator
         # -----------------
 
-        optimizer_G.zero_grad()
+        optimizer_GE.zero_grad()
 
         # Sample noise as generator input
-        z = Variable(Tensor(np.random.normal(0, 1, (imgs.shape[0], opt.latent_dim))))
-
+        z_fake = Variable(torch.normal(0, 1, (imgs.shape[0], opt.latent_dim)).float().to(device))
         # Generate a batch of images
-        gen_imgs = generator(z)
+        imgs_fake = generator(z_fake)
+
+        # Encode real images
+        encoder_out = encoder(imgs_real)
+        z_mu, z_log_sigma = encoder_out[:, :opt.latent_dim], encoder_out[:, opt.latent_dim:]
+        z_real = reparametrization(z_mu, z_log_sigma)
 
         # Loss measures generator's ability to fool the discriminator
-        g_loss = adversarial_loss(discriminator(gen_imgs), valid)
+        # Real images loss: should be classified as fake
+        output_real = discriminator(imgs_real + noise_real, z_real)
+        loss_real = adversarial_loss(output_real, label_fake)
+        # Generated images loss: vice versa
+        output_fake = discriminator(imgs_fake + noise_fake, z_fake)
+        loss_fake = adversarial_loss(output_fake, label_real)
 
-        g_loss.backward()
-        optimizer_G.step()
+        loss_g = loss_real + loss_fake
+
+        loss_g.backward()
+        optimizer_GE.step()
 
         # ---------------------
         #  Train Discriminator
@@ -188,21 +256,38 @@ for epoch in range(opt.n_epochs):
 
         optimizer_D.zero_grad()
 
+        # Detach generated/encoded vectors for discriminator training
+        imgs_fake = imgs_fake.detach()
+        z_real = z_real.detach()
+
         # Measure discriminator's ability to classify real from generated samples
-        real_loss = adversarial_loss(discriminator(real_imgs), valid)
-        fake_loss = adversarial_loss(discriminator(gen_imgs.detach()), fake)
-        d_loss = (real_loss + fake_loss) / 2
+        # Now labels will be correct
+        output_real = discriminator(imgs_real + noise_real, z_real)
+        output_fake = discriminator(imgs_fake + noise_fake, z_fake)
+        loss_real = adversarial_loss(output_real, label_real)
+        loss_fake = adversarial_loss(output_fake, label_fake)
+        loss_d = loss_real + loss_fake
 
-        d_loss.backward()
+        loss_d.backward()
         optimizer_D.step()
+        
+        # if (i + 1) % 100 == 0 or (i + 1) == len(dataloader):
+        #     # print(
+        #     #     "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
+        #     #     % (epoch + 1, opt.n_epochs, i + 1, len(dataloader), loss_d.item(), loss_g.item())
+        #     # )
+        #     print(f"Epoch: {epoch:4}, Iter: {i:4} ||| " + \
+        #         f"D Loss: {loss_d.item():.4f}, G loss: {loss_g.item():.4f}, " + \
+        #         f"D(x): {output_real.mean().item():.4f}, " + \
+        #         f"D(G(x)): {output_fake.mean().item():.4f}")
 
-        if (i + 1) % 100 == 0 or (i + 1) == len(dataloader):
-            print(
-                "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
-                % (epoch + 1, opt.n_epochs, i + 1, len(dataloader), d_loss.item(), g_loss.item())
-            )
+        kbar.update(i, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item())])
 
         batches_done = epoch * len(dataloader) + i
         if batches_done % opt.sample_interval == 0:
-            save_image(gen_imgs.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
+            save_image(imgs_fake.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
+
+    # newline for kbar
+    print()
+
 # %%
