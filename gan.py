@@ -31,14 +31,14 @@ os.makedirs("images", exist_ok=True)
 opt = argparse.Namespace(
     n_epochs=100,
     batch_size=128,
-    lr=2e-4,
+    lr=1e-4,
     b1=0.5,
     b2=0.999,
     n_cpu=8,
-    latent_dim=100,
+    latent_dim=256,
     img_size=32,
     channels=1,
-    sample_interval=400
+    sample_interval=100
 )
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -58,80 +58,62 @@ def reparametrization(mu, log_sigma):
     return mu + torch.randn_like(mu) * sigma    
 
 
+# class Generator(nn.Module):
+#     def __init__(self):
+#         super(Generator, self).__init__()
+
+#         self.init_size = opt.img_size // 4
+#         self.l1 = nn.Sequential(nn.Linear(opt.latent_dim, 128 * self.init_size ** 2))
+
+#         self.conv_blocks = nn.Sequential(
+#             nn.BatchNorm2d(128),
+#             nn.Upsample(scale_factor=2),
+#             nn.Conv2d(128, 128, 3, stride=1, padding=1),
+#             nn.BatchNorm2d(128, 0.8),
+#             nn.LeakyReLU(0.2, inplace=True),
+#             nn.Upsample(scale_factor=2),
+#             nn.Conv2d(128, 64, 3, stride=1, padding=1),
+#             nn.BatchNorm2d(64, 0.8),
+#             nn.LeakyReLU(0.2, inplace=True),
+#             nn.Conv2d(64, opt.channels, 3, stride=1, padding=1),
+#             nn.Tanh(),
+#         )
+
+#     def forward(self, z):
+#         out = self.l1(z)
+#         out = out.view(out.shape[0], 128, self.init_size, self.init_size)
+#         img = self.conv_blocks(out)
+#         return img
+
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
 
-        self.init_size = opt.img_size // 4
-        self.l1 = nn.Sequential(nn.Linear(opt.latent_dim, 128 * self.init_size ** 2))
-
+        def generator_block(in_filters, out_filters, kernel_size=3, stride=1, padding=0,
+                relu_slope=0.01, bn_eps=1e-5):
+            block = [
+                nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
+                nn.BatchNorm2d(out_filters, bn_eps),
+                nn.LeakyReLU(relu_slope, inplace=True)
+            ]
+            return block
+        
         self.conv_blocks = nn.Sequential(
-            nn.BatchNorm2d(128),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(128, 128, 3, stride=1, padding=1),
-            nn.BatchNorm2d(128, 0.8),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(128, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(64, 0.8),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, opt.channels, 3, stride=1, padding=1),
-            nn.Tanh(),
+            *generator_block(opt.latent_dim, 256, kernel_size=4, stride=1),
+            *generator_block(256, 128, kernel_size=4, stride=2),
+            *generator_block(128, 64, kernel_size=4, stride=1),
+            *generator_block(64, 32, kernel_size=4, stride=2),
+            *generator_block(32, 32, kernel_size=5, stride=1),
+            *generator_block(32, 32, kernel_size=1, stride=1),
+            nn.ConvTranspose2d(32, opt.channels, 1, stride=1, bias=False),
         )
+
+        self.output_bias = nn.Parameter(torch.zeros(opt.channels, 32, 32), requires_grad=True)
 
     def forward(self, z):
-        out = self.l1(z)
-        out = out.view(out.shape[0], 128, self.init_size, self.init_size)
-        img = self.conv_blocks(out)
-        return img
-
-
-class DiscriminatorXZ(nn.Module):
-    def __init__(self):
-        super(DiscriminatorXZ, self).__init__()
-
-        def discriminator_block(in_filters, out_filters, kernel_size=3, stride=2, padding=1,
-                bn=True, dropout=0.25, relu_slope=0.2, bn_eps=0.8):
-            block = [
-                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding), 
-                nn.LeakyReLU(relu_slope, inplace=True), 
-                nn.Dropout2d(dropout)
-            ]
-            if bn:
-                block.append(nn.BatchNorm2d(out_filters, bn_eps))
-            return block
-
-        self.x_block = nn.Sequential(
-            *discriminator_block(opt.channels, 16, bn=False),
-            *discriminator_block(16, 32),
-            *discriminator_block(32, 64),
-            *discriminator_block(64, 128),
-            *discriminator_block(128, 256),
-            *discriminator_block(256, 512),
-        )
-        self.z_block = nn.Sequential(
-            *discriminator_block(opt.latent_dim, 512, bn=False),
-            *discriminator_block(512, 512, bn=False),
-        )
-        self.joint_block = nn.Sequential(
-            *discriminator_block(1024, 1024, bn=False),
-            *discriminator_block(1024, 1024, bn=False),
-        )
-        self.adv_layer = nn.Sequential(
-            nn.Linear(1024, 1),
-            # nn.Conv2d(1024, 1, 1, stride=1, bias=True), 
-            nn.Sigmoid()
-        )
-
-    def forward(self, x, z):
-        x_repr = self.x_block(x)
-        z_repr = self.z_block(z.view(*z.shape, 1, 1))
-        joint_repr = torch.cat([x_repr, z_repr], dim=1)
-        out = self.joint_block(joint_repr)
-        out = out.view(out.shape[0], -1)
-        validity = self.adv_layer(out)
-
-        return validity
+        output = self.conv_blocks(z.view(*z.shape, 1, 1))
+        output = torch.sigmoid(output + self.output_bias)
+        return output
 
 
 class Encoder(nn.Module):
@@ -141,7 +123,7 @@ class Encoder(nn.Module):
         def encoder_block(in_filters, out_filters, kernel_size=5, stride=1, padding=0,
                 relu_slope=0.01, bn_eps=1e-5):
             block = [
-                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding), 
+                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
                 nn.BatchNorm2d(out_filters, bn_eps),
                 nn.LeakyReLU(relu_slope, inplace=True), 
             ]
@@ -155,14 +137,61 @@ class Encoder(nn.Module):
             *encoder_block(256, 512, kernel_size=4, stride=1),
             *encoder_block(512, 512, kernel_size=1, stride=1),
             # 2 * latent = (mu, sigma)
-            *encoder_block(512, 2 * opt.latent_dim, kernel_size=1, stride=1),
-            # *encoder_block(512, opt.latent_dim, kernel_size=1, stride=1),
+            nn.Conv2d(512, 2 * opt.latent_dim, 1, stride=1, bias=True),
             nn.Flatten()
         )
 
     def forward(self, x):
         out = self.model(x)
         return out
+
+
+class DiscriminatorXZ(nn.Module):
+    def __init__(self):
+        super(DiscriminatorXZ, self).__init__()
+
+        def discriminator_block(in_filters, out_filters, kernel_size=3, stride=2, padding=0, bias=False,
+                bn=True, dropout=0.2, relu_slope=0.01, bn_eps=1e-5):
+            block = [
+                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias), 
+                nn.LeakyReLU(relu_slope, inplace=True), 
+                nn.Dropout2d(dropout)
+            ]
+            if bn:
+                block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
+            return block
+
+        self.x_block = nn.Sequential(
+            *discriminator_block(opt.channels, 32, kernel_size=5, stride=1, bn=False, bias=True),
+            *discriminator_block(32, 64, kernel_size=4, stride=2),
+            *discriminator_block(64, 128, kernel_size=4, stride=1),
+            *discriminator_block(128, 256, kernel_size=4, stride=2),
+            *discriminator_block(256, 512, kernel_size=4, stride=1),
+        )
+        self.z_block = nn.Sequential(
+            *discriminator_block(opt.latent_dim, 512, kernel_size=1, stride=1, bn=False),
+            *discriminator_block(512, 512, kernel_size=1, stride=1, bn=False),
+        )
+        self.joint_block = nn.Sequential(
+            *discriminator_block(1024, 1024, kernel_size=1, stride=1, bn=False, bias=True),
+            *discriminator_block(1024, 1024, kernel_size=1, stride=1, bn=False, bias=True),
+        )
+        self.adv_layer = nn.Sequential(
+            # nn.Linear(1024, 1),
+            nn.Conv2d(1024, 1, 1, stride=1, bias=True), 
+            nn.Sigmoid(),
+            nn.Flatten()
+        )
+
+    def forward(self, x, z):
+        x_repr = self.x_block(x)
+        z_repr = self.z_block(z.view(*z.shape, 1, 1))
+        joint_repr = torch.cat([x_repr, z_repr], dim=1)
+        out = self.joint_block(joint_repr)
+        # out = out.view(out.shape[0], -1)
+        validity = self.adv_layer(out)
+
+        return validity
 
 
 # Loss function
@@ -280,7 +309,6 @@ for epoch in range(opt.n_epochs):
         #         f"D Loss: {loss_d.item():.4f}, G loss: {loss_g.item():.4f}, " + \
         #         f"D(x): {output_real.mean().item():.4f}, " + \
         #         f"D(G(x)): {output_fake.mean().item():.4f}")
-
         kbar.update(i, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item())])
 
         batches_done = epoch * len(dataloader) + i
