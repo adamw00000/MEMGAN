@@ -2,6 +2,8 @@
 import argparse
 import os
 import pkbar
+import socket
+from datetime import datetime
 
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
@@ -12,7 +14,7 @@ from torch.autograd import Variable
 import torch.nn as nn
 import torch
 
-os.makedirs("images", exist_ok=True)
+from tensorboardX import SummaryWriter
 
 # parser = argparse.ArgumentParser()
 # parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
@@ -29,7 +31,7 @@ os.makedirs("images", exist_ok=True)
 # print(opt)
 
 opt = argparse.Namespace(
-    n_epochs=100,
+    n_epochs=400,
     batch_size=128,
     lr=1e-4,
     b1=0.5,
@@ -38,10 +40,20 @@ opt = argparse.Namespace(
     latent_dim=64,
     img_size=32,
     channels=3,
-    sample_interval=100
+    # sample_interval=400,
+    dataset='CIFAR'
+    # dataset='MNIST'
 )
 
+os.makedirs(f"images_{opt.dataset}", exist_ok=True)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+logdir = os.path.join('runs', opt.dataset, current_time + '_' + socket.gethostname())
+writer = SummaryWriter(logdir)
+
+if opt.dataset == 'MNIST':
+    opt.channels = 1
 
 
 def weights_init_normal(m):
@@ -57,62 +69,68 @@ def reparametrization(mu, log_sigma):
     sigma = torch.exp(log_sigma)
     return mu + torch.randn_like(mu) * sigma    
 
-# class Generator(nn.Module):
-#     def __init__(self):
-#         super(Generator, self).__init__()
 
-#         self.init_size = opt.img_size // 4
-#         self.l1 = nn.Sequential(nn.Linear(opt.latent_dim, 128 * self.init_size ** 2))
+def get_log_odds(raw_marginals):
+    marginals = torch.clamp(raw_marginals.mean(dim=0), 1e-7, 1 - 1e-7)
+    return torch.log(marginals / (1 - marginals))
 
-#         self.conv_blocks = nn.Sequential(
-#             nn.BatchNorm2d(128),
-#             nn.Upsample(scale_factor=2),
-#             nn.Conv2d(128, 128, 3, stride=1, padding=1),
-#             nn.BatchNorm2d(128, 0.8),
-#             nn.LeakyReLU(0.1, inplace=True),
-#             nn.Upsample(scale_factor=2),
-#             nn.Conv2d(128, 64, 3, stride=1, padding=1),
-#             nn.BatchNorm2d(64, 0.8),
-#             nn.LeakyReLU(0.1, inplace=True),
-#             nn.Conv2d(64, opt.channels, 3, stride=1, padding=1),
-#             nn.Tanh(),
-#         )
-
-#     def forward(self, z):
-#         out = self.l1(z)
-#         out = out.view(out.shape[0], 128, self.init_size, self.init_size)
-#         img = self.conv_blocks(out)
-#         return img
 
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
 
-        def generator_block(in_filters, out_filters, kernel_size=3, stride=1, padding=0,
-                relu_slope=0.1, bn_eps=1e-5):
-            block = [
-                nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
-                nn.BatchNorm2d(out_filters, bn_eps),
-                nn.LeakyReLU(relu_slope, inplace=True)
-            ]
-            return block
-        
+        self.init_size = opt.img_size // 4
+        self.l1 = nn.Sequential(nn.Linear(opt.latent_dim, 128 * self.init_size ** 2))
+
         self.conv_blocks = nn.Sequential(
-            *generator_block(opt.latent_dim, 256, kernel_size=4, stride=1),
-            *generator_block(256, 128, kernel_size=4, stride=2),
-            *generator_block(128, 64, kernel_size=4, stride=1),
-            *generator_block(64, 32, kernel_size=4, stride=2),
-            *generator_block(32, 32, kernel_size=5, stride=1),
-            *generator_block(32, 32, kernel_size=1, stride=1),
-            nn.ConvTranspose2d(32, opt.channels, 1, stride=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            nn.BatchNorm2d(128, 0.8),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(128, 64, 3, stride=1, padding=1),
+            nn.BatchNorm2d(64, 0.8),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(64, opt.channels, 3, stride=1, padding=1),
+            nn.Tanh(),
         )
 
-        self.output_bias = nn.Parameter(torch.zeros(opt.channels, 32, 32), requires_grad=True)
-
     def forward(self, z):
-        output = self.conv_blocks(z.view(*z.shape, 1, 1))
-        output = torch.sigmoid(output + self.output_bias)
-        return output
+        out = self.l1(z)
+        out = out.view(out.shape[0], 128, self.init_size, self.init_size)
+        img = self.conv_blocks(out)
+        return img
+
+# class Generator(nn.Module):
+#     def __init__(self):
+#         super(Generator, self).__init__()
+
+#         def generator_block(in_filters, out_filters, kernel_size=3, stride=1, padding=0,
+#                 relu_slope=0.1, bn_eps=1e-5):
+#             block = [
+#                 nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
+#                 nn.BatchNorm2d(out_filters, bn_eps),
+#                 nn.LeakyReLU(relu_slope, inplace=True)
+#             ]
+#             return block
+        
+#         self.conv_blocks = nn.Sequential(
+#             *generator_block(opt.latent_dim, 256, kernel_size=4, stride=1),
+#             *generator_block(256, 128, kernel_size=4, stride=2),
+#             *generator_block(128, 64, kernel_size=4, stride=1),
+#             *generator_block(64, 32, kernel_size=4, stride=2),
+#             *generator_block(32, 32, kernel_size=5, stride=1),
+#             *generator_block(32, 32, kernel_size=1, stride=1),
+#             nn.ConvTranspose2d(32, opt.channels, 1, stride=1, bias=False),
+#         )
+
+#         self.output_bias = nn.Parameter(torch.zeros(opt.channels, 32, 32), requires_grad=True)
+
+#     def forward(self, z):
+#         output = self.conv_blocks(z.view(*z.shape, 1, 1))
+#         output = torch.sigmoid(output + self.output_bias)
+#         return output
 
 
 class Encoder(nn.Module):
@@ -247,32 +265,36 @@ encoder.apply(weights_init_normal)
 discriminator.apply(weights_init_normal)
 
 # Configure data loader
-# os.makedirs("../../data/mnist", exist_ok=True)
-# dataloader = torch.utils.data.DataLoader(
-#     datasets.MNIST(
-#         "../../data/mnist",
-#         train=True,
-#         download=True,
-#         transform=transforms.Compose(
-#             [transforms.Resize(opt.img_size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
-#         ),
-#     ),
-#     batch_size=opt.batch_size,
-#     shuffle=True,
-# )
-os.makedirs("./data/cifar", exist_ok=True)
-dataloader = torch.utils.data.DataLoader(
-    datasets.CIFAR10(
-        "./data/cifar",
-        train=True,
-        download=True,
-        transform=transforms.Compose(
-            [transforms.Resize(opt.img_size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+if opt.dataset == 'MNIST':
+    os.makedirs("../../data/mnist", exist_ok=True)
+    dataloader = torch.utils.data.DataLoader(
+        datasets.MNIST(
+            "../../data/mnist",
+            train=True,
+            download=True,
+            transform=transforms.Compose(
+                [transforms.Resize(opt.img_size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+            ),
         ),
-    ),
-    batch_size=opt.batch_size,
-    shuffle=True,
-)
+        batch_size=opt.batch_size,
+        shuffle=True,
+    )
+elif opt.dataset == 'CIFAR':
+    os.makedirs("./data/cifar", exist_ok=True)
+    dataloader = torch.utils.data.DataLoader(
+        datasets.CIFAR10(
+            "./data/cifar",
+            train=True,
+            download=True,
+            transform=transforms.Compose(
+                [transforms.Resize(opt.img_size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+            ),
+        ),
+        batch_size=opt.batch_size,
+        shuffle=True,
+    )
+else:
+    raise NotImplementedError()
 
 # Optimizers
 optimizer_GE = torch.optim.Adam([*generator.parameters(), *encoder.parameters()], lr=opt.lr, betas=(opt.b1, opt.b2))
@@ -287,11 +309,17 @@ for epoch in range(opt.n_epochs):
     for i, (imgs, _) in enumerate(dataloader):
 
         # Adversarial ground truths
-        label_real = Variable(torch.ones((imgs.shape[0], 1)).to(device), requires_grad=False)
-        label_fake = Variable(torch.zeros((imgs.shape[0], 1)).to(device), requires_grad=False)
+        # label_real = Variable(torch.ones((imgs.shape[0], 1)).to(device), requires_grad=False)
+        # label_fake = Variable(torch.zeros((imgs.shape[0], 1)).to(device), requires_grad=False)
+        # Label smoothing
+        label_real = Variable(torch.normal(1, 0.1, (imgs.shape[0], 1)).to(device), requires_grad=False)
+        label_fake = Variable(torch.normal(0, 0.1, (imgs.shape[0], 1)).to(device), requires_grad=False)
 
         # Configure input
         imgs_real = Variable(imgs.float().to(device))
+
+        # if epoch == 0 and i == 0:
+        #     generator.output_bias.data = get_log_odds(imgs_real)
 
         # Prepare discriminator noise
         noise_real = torch.normal(0, 0.1 * (opt.n_epochs - epoch) / opt.n_epochs, imgs_real.shape).to(device)
@@ -358,11 +386,22 @@ for epoch in range(opt.n_epochs):
         #         f"D(G(x)): {output_fake.mean().item():.4f}")
         kbar.update(i, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item())])
 
-        batches_done = epoch * len(dataloader) + i
-        if batches_done % opt.sample_interval == 0:
-            save_image(imgs_fake.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
+        # batches_done = epoch * len(dataloader) + i
+        # if batches_done % opt.sample_interval == 0:
+        if i == len(dataloader) - 1:
+            save_image(imgs_fake.data[:25], f"images_{opt.dataset}/{epoch}.png", nrow=5, normalize=True)
 
     # newline for kbar
     print()
+
+    for metric,val_packed in kbar._values.items():
+        value_sum, count = val_packed
+        writer.add_scalar(metric, value_sum / count, epoch)
+
+writer.close()
+
+torch.save(generator, os.path.join(logdir, f'model_generator.torch'))
+torch.save(encoder, os.path.join(logdir, f'model_encoder.torch'))
+torch.save(discriminator, os.path.join(logdir, f'model_discriminator.torch'))
 
 # %%
