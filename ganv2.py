@@ -41,8 +41,8 @@ opt = argparse.Namespace(
     img_size=32,
     channels=3,
     # sample_interval=400,
-    dataset='CIFAR'
-    # dataset='MNIST'
+    dataset='CIFAR',
+    # dataset='MNIST',
 )
 
 os.makedirs(f"images_{opt.dataset}", exist_ok=True)
@@ -101,36 +101,6 @@ class Generator(nn.Module):
         out = out.view(out.shape[0], 128, self.init_size, self.init_size)
         img = self.conv_blocks(out)
         return img
-
-# class Generator(nn.Module):
-#     def __init__(self):
-#         super(Generator, self).__init__()
-
-#         def generator_block(in_filters, out_filters, kernel_size=3, stride=1, padding=0,
-#                 relu_slope=0.1, bn_eps=1e-5):
-#             block = [
-#                 nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
-#                 nn.BatchNorm2d(out_filters, bn_eps),
-#                 nn.LeakyReLU(relu_slope, inplace=True)
-#             ]
-#             return block
-        
-#         self.conv_blocks = nn.Sequential(
-#             *generator_block(opt.latent_dim, 256, kernel_size=4, stride=1),
-#             *generator_block(256, 128, kernel_size=4, stride=2),
-#             *generator_block(128, 64, kernel_size=4, stride=1),
-#             *generator_block(64, 32, kernel_size=4, stride=2),
-#             *generator_block(32, 32, kernel_size=5, stride=1),
-#             *generator_block(32, 32, kernel_size=1, stride=1),
-#             nn.ConvTranspose2d(32, opt.channels, 1, stride=1, bias=False),
-#         )
-
-#         self.output_bias = nn.Parameter(torch.zeros(opt.channels, 32, 32), requires_grad=True)
-
-#     def forward(self, z):
-#         output = self.conv_blocks(z.view(*z.shape, 1, 1))
-#         output = torch.sigmoid(output + self.output_bias)
-#         return output
 
 
 class Encoder(nn.Module):
@@ -317,9 +287,6 @@ for epoch in range(opt.n_epochs):
 
         # Configure input
         imgs_real = Variable(imgs.float().to(device))
-
-        # if epoch == 0 and i == 0:
-        #     generator.output_bias.data = get_log_odds(imgs_real)
 
         # Prepare discriminator noise
         noise_real = torch.normal(0, 0.1 * (opt.n_epochs - epoch) / opt.n_epochs, imgs_real.shape).to(device)
