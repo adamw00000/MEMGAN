@@ -31,7 +31,7 @@ opt = argparse.Namespace(
     # dataset='MNIST',
 )
 
-IMAGE_DIR = f"images_{opt.dataset}"
+IMAGE_DIR = f"images_ALICE_{opt.dataset}"
 
 os.makedirs(IMAGE_DIR, exist_ok=True)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -347,11 +347,11 @@ for epoch in range(opt.n_epochs):
         noise_real = torch.normal(0, 0.1 * (opt.n_epochs - epoch) / opt.n_epochs, imgs_real.shape).to(device)
         noise_fake = torch.normal(0, 0.1 * (opt.n_epochs - epoch) / opt.n_epochs, imgs_real.shape).to(device)
 
-        # -----------------
-        #  Train Generator
-        # -----------------
+        # ---------------------
+        #  Train Discriminator
+        # ---------------------
 
-        optimizer_GE.zero_grad()
+        optimizer_D.zero_grad()
 
         # Sample noise as generator input
         z_fake = Variable(torch.normal(0, 1, (imgs.shape[0], opt.latent_dim)).float().to(device))
@@ -362,6 +362,24 @@ for epoch in range(opt.n_epochs):
         encoder_out = encoder(imgs_real)
         z_mu, z_log_sigma = encoder_out[:, :opt.latent_dim], encoder_out[:, opt.latent_dim:]
         z_real = reparametrization(z_mu, z_log_sigma)
+
+        # Measure discriminator's ability to classify real from generated samples
+        # Now labels will be correct
+        output_xz_real = discriminator_xz(imgs_real + noise_real, z_real.detach())
+        output_xz_fake = discriminator_xz(imgs_fake.detach() + noise_fake, z_fake)
+        loss_real = adversarial_loss(output_xz_real, label_real)
+        loss_fake = adversarial_loss(output_xz_fake, label_fake)
+
+        loss_d = loss_real + loss_fake
+        
+        loss_d.backward()
+        optimizer_D.step()
+
+        # -----------------
+        #  Train Generator
+        # -----------------
+
+        optimizer_GE.zero_grad()
 
         # Cycle consistency
         imgs_recon = generator(z_real)
@@ -386,54 +404,15 @@ for epoch in range(opt.n_epochs):
 
         loss_g_ce.backward()
         optimizer_GE.step()
-
-        # ---------------------
-        #  Train Discriminator
-        # ---------------------
-
-        optimizer_D.zero_grad()
-
-        # Detach generated/encoded vectors for discriminator training
-        imgs_fake = imgs_fake.detach()
-        z_real = z_real.detach()
-        imgs_recon = imgs_recon.detach()
-
-        # Measure discriminator's ability to classify real from generated samples
-        # Now labels will be correct
-        output_xz_real = discriminator_xz(imgs_real + noise_real, z_real)
-        output_xz_fake = discriminator_xz(imgs_fake + noise_fake, z_fake)
-        loss_real = adversarial_loss(output_xz_real, label_real)
-        loss_fake = adversarial_loss(output_xz_fake, label_fake)
-
-        # Cycle consistency loss
-        output_xx_real = discriminator_xx(imgs_real, imgs_real)
-        loss_xx_real = adversarial_loss(output_xx_real, label_real)
-        output_xx_recon = discriminator_xx(imgs_real, imgs_recon)
-        loss_xx_recon = adversarial_loss(output_xx_recon, label_fake)
-        cc_loss = loss_xx_real + loss_xx_recon
-
-        loss_d = loss_real + loss_fake + cc_loss
-        loss_d_ce = loss_d + cc_loss
-
-        loss_d_ce.backward()
-        optimizer_D.step()
         
-        # if (i + 1) % 100 == 0 or (i + 1) == len(dataloader):
-        #     # print(
-        #     #     "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
-        #     #     % (epoch + 1, opt.n_epochs, i + 1, len(dataloader), loss_d.item(), loss_g.item())
-        #     # )
-        #     print(f"Epoch: {epoch:4}, Iter: {i:4} ||| " + \
-        #         f"D Loss: {loss_d.item():.4f}, G loss: {loss_g.item():.4f}, " + \
-        #         f"D(x): {output_real.mean().item():.4f}, " + \
-        #         f"D(G(x)): {output_fake.mean().item():.4f}")
+        # -----------------
+        #  Process results
+        # -----------------
+
         kbar.update(i + 1, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_xz_real.mean().item()), ("D(G(x))", output_xz_fake.mean().item())])
 
-        # batches_done = epoch * len(dataloader) + i
-        # if batches_done % opt.sample_interval == 0:
         if i == len(dataloader) - 1:
             with torch.no_grad():
-                # gen_examples = imgs_fake.data[:(vis_rows**2)]
                 gen_examples = generator(vis_noise).detach().cpu()
                 save_image(gen_examples, 
                     os.path.join(IMAGE_DIR, f'{epoch+1}.png'),
