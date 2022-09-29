@@ -65,6 +65,30 @@ def get_log_odds(raw_marginals):
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
+        
+        ngf = 64
+        def generator_block(in_filters, out_filters, kernel_size=4, stride=2, padding=1,
+                bn=True, bn_eps=1e-5):
+            block = [
+                nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
+                nn.ReLU(inplace=True), 
+            ]
+            if bn:
+                block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
+            return block
+
+        # self.main = nn.Sequential(
+        #     # input is Z, going into a convolution
+        #     *generator_block(opt.latent_dim, ngf * 4, 4, 1, 0),
+        #     # state size. (ngf*4) x 4 x 4
+        #     *generator_block(ngf * 4, ngf * 2, 4, 2, 1),
+        #     # state size. (ngf*2) x 8 x 8
+        #     *generator_block(ngf * 2, ngf, 4, 2, 1),
+        #     # state size. (ngf) x 16 x 16
+        #     nn.ConvTranspose2d(ngf, opt.channels, 4, 2, 1, bias=False),
+        #     # state size. (opt.channels) x 32 x 32
+        #     nn.Tanh()
+        # )
 
         self.init_size = opt.img_size // 4
         self.l1 = nn.Sequential(nn.Linear(opt.latent_dim, 128 * self.init_size ** 2))
@@ -88,31 +112,47 @@ class Generator(nn.Module):
         out = out.view(out.shape[0], 128, self.init_size, self.init_size)
         img = self.conv_blocks(out)
         return img
+    
+    # def forward(self, z):
+    #     # out = self.l1(z)
+    #     # out = out.view(out.shape[0], 128, self.init_size, self.init_size)
+    #     img = self.main(z.view(*z.shape, 1, 1))
+    #     return img
 
 
 class Encoder(nn.Module):
     def __init__(self):
         super(Encoder, self).__init__()
 
-        def encoder_block(in_filters, out_filters, kernel_size=5, stride=1, padding=0,
-                relu_slope=0.1, bn_eps=1e-5):
+        def encoder_block(in_filters, out_filters, kernel_size=4, stride=2, padding=1,
+                bn=True, relu_slope=0.2, bn_eps=1e-5):
             block = [
                 nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
-                nn.BatchNorm2d(out_filters, bn_eps),
                 nn.LeakyReLU(relu_slope, inplace=True), 
             ]
+            if bn:
+                block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
             return block
 
+        nde = 64
         self.model = nn.Sequential(
-            *encoder_block(opt.channels, 32, kernel_size=5, stride=1),
-            *encoder_block(32, 64, kernel_size=4, stride=2),
-            *encoder_block(64, 128, kernel_size=4, stride=1),
-            *encoder_block(128, 256, kernel_size=4, stride=2),
-            *encoder_block(256, 512, kernel_size=4, stride=1),
-            *encoder_block(512, 512, kernel_size=1, stride=1),
+            # input: (opt.channels) x 32 x 32
+            *encoder_block(opt.channels, nde, 4, 2, 1, bn=False),
+            # state size: (nde) x 16 x 16
+            *encoder_block(nde, 2 * nde, 4, 2, 1),
+            # state size: (2*nde) x 8 x 8
+            *encoder_block(2 * nde, 4 * nde, 4, 2, 1),
+            # state size: (4*nde) x 4 x 4
+            *encoder_block(4 * nde, 8 * nde, 4, 2, 1),
+            # state size: (8*nde) x 2 x 2
+            *encoder_block(8 * nde, 16 * nde, 4, 2, 1),
+            # state size: (16*nde) x 1 x 1
             # 2 * latent = (mu, sigma)
-            nn.Conv2d(512, 2 * opt.latent_dim, 1, stride=1, bias=True),
-            nn.Flatten()
+            nn.Conv2d(16 * nde, 2 * opt.latent_dim, 1, 1, 0, bias=False),
+            # state size: (2 * opt.latent_dim) x 1 x 1
+            nn.Flatten(),
+            # state size: (2 * opt.latent_dim)
+            nn.Tanh(),
         )
 
     def forward(self, x):
@@ -120,74 +160,54 @@ class Encoder(nn.Module):
         return out
 
 
-class MaxOut2D(nn.Module):
-    """
-    Pytorch implementation of MaxOut on channels for an input that is C x H x W.
-    Reshape input from N x C x H x W --> N x H*W x C --> perform MaxPool1D on dim 2, i.e. channels --> reshape back to
-    N x C//maxout_kernel x H x W.
-    """
-    def __init__(self, max_out):
-        super(MaxOut2D, self).__init__()
-        self.max_out = max_out
-        self.max_pool = nn.MaxPool1d(max_out)
-
-    def forward(self, x):
-        batch_size = x.shape[0]
-        channels = x.shape[1]
-        height = x.shape[2]
-        width = x.shape[3]
-        # Reshape input from N x C x H x W --> N x H*W x C
-        x_reshape = torch.permute(x, (0, 2, 3, 1)).view(batch_size, height * width, channels)
-        # Pool along channel dims
-        x_pooled = self.max_pool(x_reshape)
-        # Reshape back to N x C//maxout_kernel x H x W.
-        return torch.permute(x_pooled, (0, 2, 1)).view(batch_size, channels // self.max_out, height, width).contiguous()
-
-
 class DiscriminatorXZ(nn.Module):
     def __init__(self):
         super(DiscriminatorXZ, self).__init__()
 
-        def discriminator_block(in_filters, out_filters, kernel_size=3, stride=2, padding=0, bias=False,
-                bn=True, dropout=0.2, relu_slope=0.1, bn_eps=1e-5):
+        def discriminator_block(in_filters, out_filters, kernel_size=4, stride=2, padding=1, bias=False,
+                bn=True, dropout=0.2, relu_slope=0.2, bn_eps=1e-5):
             block = [
                 nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias), 
-                # nn.LeakyReLU(relu_slope, inplace=True), 
-                nn.Dropout2d(dropout)
-                # MaxOut2D(2)
+                nn.LeakyReLU(relu_slope, inplace=True), 
             ]
-            # if bn:
-            #     block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
+            if bn:
+                block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
             return block
 
+        ndf = 64
+
         self.x_block = nn.Sequential(
-            *discriminator_block(opt.channels, 32, kernel_size=5, stride=1, dropout=0.2, bn=False, bias=True),
-            MaxOut2D(2),
-            *discriminator_block(16, 64, kernel_size=4, stride=2, dropout=0.5),
-            MaxOut2D(2),
-            *discriminator_block(32, 128, kernel_size=4, stride=1, dropout=0.5),
-            MaxOut2D(2),
-            *discriminator_block(64, 256, kernel_size=4, stride=2, dropout=0.5),
-            MaxOut2D(2),
-            *discriminator_block(128, 512, kernel_size=4, stride=1, dropout=0.5),
-            MaxOut2D(2),
+            # input: (nc) x 32 x 32
+            *discriminator_block(opt.channels, 1 * ndf, 4, 2, 1, bn=False, bias=True),
+            # state size: (ndf) x 16 x 16
+            *discriminator_block(1 * ndf, 2 * ndf, 4, 2, 1),
+            # state size: (2*ndf) x 8 x 8
+            *discriminator_block(2 * ndf, 4 * ndf, 4, 2, 1),
+            # state size: (4*ndf) x 4 x 4
+            *discriminator_block(4 * ndf, 8 * ndf, 4, 2, 1),
+            # state size: (8*ndf) x 2 x 2
+            *discriminator_block(8 * ndf, 16 * ndf, 4, 2, 1),
+            # state size: (16*ndf) x 1 x 1
         )
+
+        nfz = 16 * ndf * 1 * 1
+
         self.z_block = nn.Sequential(
-            *discriminator_block(opt.latent_dim, 512, kernel_size=1, stride=1, dropout=0.2, bn=False),
-            MaxOut2D(2),
-            *discriminator_block(256, 512, kernel_size=1, stride=1, dropout=0.5, bn=False),
-            MaxOut2D(2),
+            # input: (opt.latent_dim) x 1 x 1
+            *discriminator_block(opt.latent_dim, nfz, 1, 1, 0, bn=False),
+            # state size: (nfz) x 1 x 1
+            *discriminator_block(nfz, nfz, 1, 1, 0),
+            # state size: (nfz) x 1 x 1
         )
         self.joint_block = nn.Sequential(
-            *discriminator_block(512, 1024, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
-            MaxOut2D(2),
-            *discriminator_block(512, 1024, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
-            MaxOut2D(2),
+            *discriminator_block(2 * nfz, 2 * nfz, 1, 1, 0),
+            *discriminator_block(2 * nfz, 2 * nfz, 1, 1, 0),
         )
         self.adv_layer = nn.Sequential(
             # nn.Linear(1024, 1),
             # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
-            *discriminator_block(512, 1, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
+            # *discriminator_block(2 * nfz, 1, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
+            nn.Conv2d(2 * nfz, 1, 1, 1, 0), 
             nn.Sigmoid(),
             nn.Flatten()
         )

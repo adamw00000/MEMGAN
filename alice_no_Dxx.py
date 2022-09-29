@@ -2,7 +2,6 @@
 import argparse
 import os
 import pkbar
-import socket
 from datetime import datetime
 
 import torchvision.transforms as transforms
@@ -15,20 +14,6 @@ import torch.nn as nn
 import torch
 
 from tensorboardX import SummaryWriter
-
-# parser = argparse.ArgumentParser()
-# parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
-# parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
-# parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
-# parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
-# parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
-# parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
-# parser.add_argument("--latent_dim", type=int, default=100, help="dimensionality of the latent space")
-# parser.add_argument("--img_size", type=int, default=32, help="size of each image dimension")
-# parser.add_argument("--channels", type=int, default=1, help="number of image channels")
-# parser.add_argument("--sample_interval", type=int, default=400, help="interval between image sampling")
-# opt = parser.parse_args()
-# print(opt)
 
 opt = argparse.Namespace(
     n_epochs=400,
@@ -45,11 +30,13 @@ opt = argparse.Namespace(
     # dataset='MNIST',
 )
 
-os.makedirs(f"images_{opt.dataset}", exist_ok=True)
+IMAGE_DIR = f"images_{opt.dataset}"
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-logdir = os.path.join('runs', opt.dataset, current_time + '_' + socket.gethostname())
+logdir = os.path.join('runs', opt.dataset, current_time)
 writer = SummaryWriter(logdir)
 
 if opt.dataset == 'MNIST':
@@ -58,11 +45,11 @@ if opt.dataset == 'MNIST':
 
 def weights_init_normal(m):
     classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        torch.nn.init.normal_(m.weight.data, 0.0, 0.01)
-    elif classname.find("BatchNorm2d") != -1:
-        torch.nn.init.normal_(m.weight.data, 0.0, 0.01)
-        torch.nn.init.constant_(m.bias.data, 0.0)
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
 
 
 def reparametrization(mu, log_sigma):
@@ -278,6 +265,10 @@ else:
 optimizer_GE = torch.optim.Adam([*generator.parameters(), *encoder.parameters()], lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
+# For visualization
+vis_rows = 8
+vis_noise = torch.normal(0, 1, (vis_rows ** 2, opt.latent_dim)).float().to(device)
+
 # ----------
 #  Training
 # ----------
@@ -371,7 +362,12 @@ for epoch in range(opt.n_epochs):
         # batches_done = epoch * len(dataloader) + i
         # if batches_done % opt.sample_interval == 0:
         if i == len(dataloader) - 1:
-            save_image(imgs_fake.data[:25], f"images_{opt.dataset}/{epoch+1}.png", nrow=5, normalize=True)
+            with torch.no_grad():
+                # gen_examples = imgs_fake.data[:(vis_rows**2)]
+                gen_examples = generator(vis_noise).detach().cpu()
+                save_image(gen_examples, 
+                    os.path.join(IMAGE_DIR, f'{epoch+1}.png'),
+                    nrow=vis_rows, normalize=True)
 
     for metric,val_packed in kbar._values.items():
         value_sum, count = val_packed
