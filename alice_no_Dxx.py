@@ -40,7 +40,6 @@ opt = argparse.Namespace(
     latent_dim=64,
     img_size=32,
     channels=3,
-    par_lambda=0.1,
     # sample_interval=400,
     dataset='CIFAR',
     # dataset='MNIST',
@@ -193,8 +192,8 @@ class DiscriminatorXZ(nn.Module):
             MaxOut2D(2),
         )
         self.joint_block = nn.Sequential(
-            # *discriminator_block(512, 1024, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
-            # MaxOut2D(2),
+            *discriminator_block(512, 1024, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
+            MaxOut2D(2),
             *discriminator_block(512, 1024, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
             MaxOut2D(2),
         )
@@ -217,78 +216,23 @@ class DiscriminatorXZ(nn.Module):
         return validity
 
 
-class DiscriminatorXX(nn.Module):
-    def __init__(self):
-        super(DiscriminatorXX, self).__init__()
-
-        def discriminator_block(in_filters, out_filters, kernel_size=3, stride=2, padding=0, bias=False,
-                bn=True, dropout=0.2, relu_slope=0.1, bn_eps=1e-5):
-            block = [
-                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias), 
-                # nn.LeakyReLU(relu_slope, inplace=True), 
-                nn.Dropout2d(dropout)
-                # MaxOut2D(2)
-            ]
-            # if bn:
-            #     block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
-            return block
-
-        self.x_block = nn.Sequential(
-            *discriminator_block(opt.channels, 32, kernel_size=5, stride=1, dropout=0.2, bn=False, bias=True),
-            MaxOut2D(2),
-            *discriminator_block(16, 64, kernel_size=4, stride=2, dropout=0.5),
-            MaxOut2D(2),
-            *discriminator_block(32, 128, kernel_size=4, stride=1, dropout=0.5),
-            MaxOut2D(2),
-            *discriminator_block(64, 256, kernel_size=4, stride=2, dropout=0.5),
-            MaxOut2D(2),
-            *discriminator_block(128, 256, kernel_size=4, stride=1, dropout=0.5),
-            MaxOut2D(2),
-        )
-        self.joint_block = nn.Sequential(
-            *discriminator_block(256, 512, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
-            MaxOut2D(2),
-            *discriminator_block(256, 512, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
-            MaxOut2D(2),
-        )
-        self.adv_layer = nn.Sequential(
-            # nn.Linear(1024, 1),
-            # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
-            *discriminator_block(256, 1, kernel_size=1, stride=1, dropout=0.5, bn=False, bias=True),
-            nn.Sigmoid(),
-            nn.Flatten()
-        )
-
-    def forward(self, x, x_prime):
-        x_repr = self.x_block(x)
-        x_prime_repr = self.x_block(x_prime)
-        joint_repr = torch.cat([x_repr, x_prime_repr], dim=1)
-        out = self.joint_block(joint_repr)
-        # out = out.view(out.shape[0], -1)
-        validity = self.adv_layer(out)
-
-        return validity
-
 # Loss function
 adversarial_loss = torch.nn.BCELoss()
 
 # Initialize generator and discriminator
 generator = Generator()
 encoder = Encoder()
-discriminator_xz = DiscriminatorXZ()
-discriminator_xx = DiscriminatorXX()
+discriminator = DiscriminatorXZ()
 
 generator.to(device)
 encoder.to(device)
-discriminator_xz.to(device)
-discriminator_xx.to(device)
+discriminator.to(device)
 adversarial_loss.to(device)
 
 # Initialize weights
 generator.apply(weights_init_normal)
 encoder.apply(weights_init_normal)
-discriminator_xz.apply(weights_init_normal)
-discriminator_xx.apply(weights_init_normal)
+discriminator.apply(weights_init_normal)
 
 # Configure data loader
 if opt.dataset == 'MNIST':
@@ -332,7 +276,7 @@ else:
 
 # Optimizers
 optimizer_GE = torch.optim.Adam([*generator.parameters(), *encoder.parameters()], lr=opt.lr, betas=(opt.b1, opt.b2))
-optimizer_D = torch.optim.Adam([*discriminator_xz.parameters(), *discriminator_xx.parameters()], lr=opt.lr, betas=(opt.b1, opt.b2))
+optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
 # ----------
 #  Training
@@ -377,23 +321,19 @@ for epoch in range(opt.n_epochs):
 
         # Loss measures generator's ability to fool the discriminator
         # Real images loss: should be classified as fake
-        output_xz_real = discriminator_xz(imgs_real + noise_real, z_real)
-        loss_real = adversarial_loss(output_xz_real, label_fake)
+        output_real = discriminator(imgs_real + noise_real, z_real)
+        loss_real = adversarial_loss(output_real, label_fake)
         # Generated images loss: vice versa
-        output_xz_fake = discriminator_xz(imgs_fake + noise_fake, z_fake)
-        loss_fake = adversarial_loss(output_xz_fake, label_real)
+        output_fake = discriminator(imgs_fake + noise_fake, z_fake)
+        loss_fake = adversarial_loss(output_fake, label_real)
 
-        # Cycle consistency loss
-        output_xx_real = discriminator_xx(imgs_real, imgs_real)
-        loss_xx_real = adversarial_loss(output_xx_real, label_fake)
-        output_xx_recon = discriminator_xx(imgs_real, imgs_recon)
-        loss_xx_recon = adversarial_loss(output_xx_recon, label_real)
-        cc_loss = loss_xx_real + loss_xx_recon
+        # Reconstruction loss
+        recon_loss = torch.norm(imgs_recon - imgs_real, p=2)
 
         loss_g = loss_real + loss_fake
-        loss_g_ce = loss_g + opt.par_lambda * cc_loss
+        loss_g_full = loss_g + recon_loss
 
-        loss_g_ce.backward()
+        loss_g_full.backward()
         optimizer_GE.step()
 
         # ---------------------
@@ -405,26 +345,16 @@ for epoch in range(opt.n_epochs):
         # Detach generated/encoded vectors for discriminator training
         imgs_fake = imgs_fake.detach()
         z_real = z_real.detach()
-        imgs_recon = imgs_recon.detach()
 
         # Measure discriminator's ability to classify real from generated samples
         # Now labels will be correct
-        output_xz_real = discriminator_xz(imgs_real + noise_real, z_real)
-        output_xz_fake = discriminator_xz(imgs_fake + noise_fake, z_fake)
-        loss_real = adversarial_loss(output_xz_real, label_real)
-        loss_fake = adversarial_loss(output_xz_fake, label_fake)
+        output_real = discriminator(imgs_real + noise_real, z_real)
+        output_fake = discriminator(imgs_fake + noise_fake, z_fake)
+        loss_real = adversarial_loss(output_real, label_real)
+        loss_fake = adversarial_loss(output_fake, label_fake)
+        loss_d = loss_real + loss_fake
 
-        # Cycle consistency loss
-        output_xx_real = discriminator_xx(imgs_real, imgs_real)
-        loss_xx_real = adversarial_loss(output_xx_real, label_real)
-        output_xx_recon = discriminator_xx(imgs_real, imgs_recon)
-        loss_xx_recon = adversarial_loss(output_xx_recon, label_fake)
-        cc_loss = loss_xx_real + loss_xx_recon
-
-        loss_d = loss_real + loss_fake + cc_loss
-        loss_d_ce = loss_d + cc_loss
-
-        loss_d_ce.backward()
+        loss_d.backward()
         optimizer_D.step()
         
         # if (i + 1) % 100 == 0 or (i + 1) == len(dataloader):
@@ -436,12 +366,12 @@ for epoch in range(opt.n_epochs):
         #         f"D Loss: {loss_d.item():.4f}, G loss: {loss_g.item():.4f}, " + \
         #         f"D(x): {output_real.mean().item():.4f}, " + \
         #         f"D(G(x)): {output_fake.mean().item():.4f}")
-        kbar.update(i + 1, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_xz_real.mean().item()), ("D(G(x))", output_xz_fake.mean().item())])
+        kbar.update(i + 1, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item()), ("Reconstruction loss", recon_loss.item())])
 
         # batches_done = epoch * len(dataloader) + i
         # if batches_done % opt.sample_interval == 0:
         if i == len(dataloader) - 1:
-            save_image(imgs_fake.data[:25], f"images_{opt.dataset}/{epoch + 1}.png", nrow=5, normalize=True)
+            save_image(imgs_fake.data[:25], f"images_{opt.dataset}/{epoch+1}.png", nrow=5, normalize=True)
 
     for metric,val_packed in kbar._values.items():
         value_sum, count = val_packed
@@ -451,6 +381,6 @@ writer.close()
 
 torch.save(generator, os.path.join(logdir, f'model_generator.torch'))
 torch.save(encoder, os.path.join(logdir, f'model_encoder.torch'))
-torch.save(discriminator_xz, os.path.join(logdir, f'model_discriminator.torch'))
+torch.save(discriminator, os.path.join(logdir, f'model_discriminator.torch'))
 
 # %%

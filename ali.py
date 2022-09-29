@@ -243,7 +243,11 @@ if opt.dataset == 'MNIST':
             train=True,
             download=True,
             transform=transforms.Compose(
-                [transforms.Resize(opt.img_size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+                [
+                    transforms.Resize(opt.img_size), 
+                    transforms.ToTensor(), 
+                    # transforms.Normalize([0.5], [0.5])
+                ]
             ),
         ),
         batch_size=opt.batch_size,
@@ -257,7 +261,11 @@ elif opt.dataset == 'CIFAR':
             train=True,
             download=True,
             transform=transforms.Compose(
-                [transforms.Resize(opt.img_size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+                [
+                    transforms.Resize(opt.img_size), 
+                    transforms.ToTensor(), 
+                    # transforms.Normalize([0.5], [0.5])
+                ]
             ),
         ),
         batch_size=opt.batch_size,
@@ -351,15 +359,12 @@ for epoch in range(opt.n_epochs):
         #         f"D Loss: {loss_d.item():.4f}, G loss: {loss_g.item():.4f}, " + \
         #         f"D(x): {output_real.mean().item():.4f}, " + \
         #         f"D(G(x)): {output_fake.mean().item():.4f}")
-        kbar.update(i, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item())])
+        kbar.update(i + 1, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item())])
 
         # batches_done = epoch * len(dataloader) + i
         # if batches_done % opt.sample_interval == 0:
         if i == len(dataloader) - 1:
-            save_image(imgs_fake.data[:25], f"images_{opt.dataset}/{epoch}.png", nrow=5, normalize=True)
-
-    # newline for kbar
-    print()
+            save_image(imgs_fake.data[:25], f"images_{opt.dataset}/{epoch+1}.png", nrow=5, normalize=True)
 
     for metric,val_packed in kbar._values.items():
         value_sum, count = val_packed
