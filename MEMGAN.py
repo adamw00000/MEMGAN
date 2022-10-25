@@ -4,6 +4,7 @@ import os
 import pkbar
 from datetime import datetime
 import numpy as np
+from sklearn import metrics
 
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
@@ -38,12 +39,13 @@ opt = argparse.Namespace(
     dataset='MNIST',
 )
 
-IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v4"
+IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v5"
 
 os.makedirs(IMAGE_DIR, exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'RANDOM_SAMPLES'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'MEMORY_GEN_SAMPLES'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'MEMORY_VIS'), exist_ok=True)
+os.makedirs(os.path.join(IMAGE_DIR, 'TEST_RECONS'), exist_ok=True)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 current_time = datetime.now().strftime('%b%d_%H-%M-%S')
@@ -415,12 +417,12 @@ for epoch in range(opt.n_epochs):
         # Cycle consistency loss
         imgs_recon = generator(projection)
         cc_loss = torch.mean(
-            torch.norm((imgs_recon - imgs_real).reshape(batch_size, -1), p=2, dim=1)
+            torch.linalg.vector_norm((imgs_recon - imgs_real), ord=2, dim=(1, 2, 3))
         )
         
         # Memory projection loss
         mp_loss = torch.mean(
-            torch.norm((projection - z_real).reshape(batch_size, -1), p=2, dim=1)
+            torch.linalg.vector_norm((projection - z_real), ord=2, dim=1)
         )
 
         # Mutual information loss
@@ -453,7 +455,7 @@ for epoch in range(opt.n_epochs):
         # Cycle consistency loss
         imgs_recon = generator(projection.detach())
         cc_loss = torch.mean(
-            torch.norm((imgs_recon - imgs_real).reshape(batch_size, -1), p=2, dim=1)
+            torch.linalg.vector_norm((imgs_recon - imgs_real), ord=2, dim=(1, 2, 3))
         )
 
         # Mutual information loss
@@ -479,12 +481,12 @@ for epoch in range(opt.n_epochs):
         # Cycle consistency loss
         imgs_recon = generator(projection)
         cc_loss = torch.mean(
-            torch.norm((imgs_recon - imgs_real).reshape(batch_size, -1), p=2, dim=1)
+            torch.linalg.vector_norm((imgs_recon - imgs_real), ord=2, dim=(1, 2, 3))
         )
         
         # Memory projection loss
         mp_loss = torch.mean(
-            torch.norm((projection - z_real.detach()).reshape(batch_size, -1), p=2, dim=1)
+            torch.linalg.vector_norm((projection - z_real.detach()), ord=2, dim=1)
         )
 
         # Mutual information loss
@@ -507,7 +509,7 @@ for epoch in range(opt.n_epochs):
         #  Process results
         # -----------------
 
-        kbar.update(i + 1, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item()), ("M loss", loss_m.item()), ("E loss", loss_e.item())])
+        kbar.update(i, values=[("D Loss", loss_d.item()), ("G loss", loss_g.item()), ("D(x)", output_real.mean().item()), ("D(G(x))", output_fake.mean().item()), ("M loss", loss_m.item()), ("E loss", loss_e.item())])
 
         if i == len(dataloader_train) - 1:
             with torch.no_grad():
@@ -528,14 +530,60 @@ for epoch in range(opt.n_epochs):
                     os.path.join(IMAGE_DIR, 'MEMORY_VIS', f'{epoch+1}.png'),
                     nrow=int(np.sqrt(opt.n_memory)), normalize=True)
 
-    for metric,val_packed in kbar._values.items():
-        value_sum, count = val_packed
-        writer.add_scalar(metric, value_sum / count, epoch)
-    
     scheduler_G.step()
     scheduler_E.step()
     scheduler_D.step()
     scheduler_M.step()
+
+    generator.eval()
+    encoder.eval()
+    discriminator.eval()
+    M.eval()
+
+    with torch.no_grad():
+        pred_scores = []
+        true_labels = []
+
+        for i, (imgs, labels) in enumerate(dataloader_test):
+            batch_size = len(imgs)
+
+            # Calculate anomaly scores
+            imgs = imgs.float().to(device)
+            imgs_recon = generator(M.P(reparametrization(encoder(imgs))))
+            scores = torch.norm((imgs - imgs_recon).reshape(batch_size, -1), p=2, dim=1)
+            pred_scores.append(scores.detach())
+            true_labels.append(labels)
+
+            if i == 0:
+                imgs_with_recons = torch.zeros(2 * vis_rows**2, imgs.shape[1], imgs.shape[2], imgs.shape[3])
+                imgs_with_recons[::2] = imgs[:vis_rows**2]
+                imgs_with_recons[1::2] = imgs_recon[:vis_rows**2]
+                save_image(imgs_with_recons, 
+                    os.path.join(IMAGE_DIR, 'TEST_RECONS', f'{epoch+1}.png'),
+                    nrow=2 * vis_rows, normalize=True)
+
+        pred_scores = torch.cat(pred_scores).cpu().numpy()
+        true_labels = torch.cat(true_labels).cpu().numpy()
+
+        auc = metrics.roc_auc_score(true_labels, -pred_scores)
+
+        inliers = np.where(true_labels == 1)[0]
+        inliers_mask = np.zeros_like(pred_scores, dtype=np.bool)
+        inliers_mask[inliers] = True
+
+        mean_inlier_score = np.mean(pred_scores[inliers_mask])
+        mean_outlier_score = np.mean(pred_scores[~inliers_mask])
+
+        kbar.add(1, values=[("AUC", auc), ("A(IN)", mean_inlier_score), ("A(OUT)", mean_outlier_score)])
+
+    generator.train()
+    encoder.train()
+    discriminator.train()
+    M.train()
+
+    for metric,val_packed in kbar._values.items():
+        value_sum, count = val_packed
+        writer.add_scalar(metric, value_sum / count, epoch)
     
     writer.flush()
 
@@ -544,5 +592,6 @@ writer.close()
 torch.save(generator, os.path.join(logdir, f'model_generator.torch'))
 torch.save(encoder, os.path.join(logdir, f'model_encoder.torch'))
 torch.save(discriminator, os.path.join(logdir, f'model_discriminator.torch'))
+torch.save(M, os.path.join(logdir, f'model_memory.torch'))
 
 # %%
