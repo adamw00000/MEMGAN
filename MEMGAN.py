@@ -10,6 +10,7 @@ from torchvision.utils import save_image
 
 from torchvision import datasets
 from torch.autograd import Variable
+from torch.optim.lr_scheduler import StepLR
 
 import torch
 import torch.nn as nn
@@ -37,9 +38,10 @@ opt = argparse.Namespace(
     dataset='MNIST',
 )
 
-IMAGE_DIR = f"images_MEMGAN_{opt.dataset}"
+IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v4"
 
 os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(os.path.join(IMAGE_DIR, 'RANDOM_SAMPLES'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'MEMORY_GEN_SAMPLES'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'MEMORY_VIS'), exist_ok=True)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -89,10 +91,10 @@ class Generator(nn.Module):
         ngf = 32
         
         self.conv_blocks = nn.Sequential(
-            *generator_block(opt.latent_dim, ngf * 8, 4, 1, 0, bias=False),
-            *generator_block(ngf * 8, ngf * 4, 3, 2, 1, bias=False),
-            *generator_block(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
-            *generator_block(ngf * 2, ngf * 1, 1, 1, 0, bias=False),
+            *generator_block(opt.latent_dim, ngf * 8, 1, 1, 0, bias=False),
+            *generator_block(ngf * 8, ngf * 4, 4, 1, 0, bias=False),
+            *generator_block(ngf * 4, ngf * 2, 3, 2, 1, bias=False),
+            *generator_block(ngf * 2, ngf * 1, 4, 2, 1, bias=False),
             nn.ConvTranspose2d(ngf, opt.channels, 4, 2, 1, bias=False),
             nn.Tanh(),
         )
@@ -121,8 +123,9 @@ class Encoder(nn.Module):
             *encoder_block(opt.channels, nef, 4, 2, 1),
             *encoder_block(nef * 1, nef * 2, 4, 2, 1),
             *encoder_block(nef * 2, nef * 4, 3, 2, 1),
+            *encoder_block(nef * 4, nef * 8, 4, 1, 0),
             # 2 * latent = (mu, sigma)
-            nn.Conv2d(nef * 4, 2 * opt.latent_dim, 4, 1, 0, bias=True),
+            nn.Conv2d(nef * 8, 2 * opt.latent_dim, 1, 1, 0, bias=True),
             nn.Flatten()
         )
 
@@ -160,7 +163,7 @@ class DiscriminatorXZ(nn.Module):
         )
         self.joint_block = nn.Sequential(
             # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-            *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+            # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
         )
         self.adv_layer = nn.Sequential(
             # nn.Linear(1024, 1),
@@ -194,8 +197,12 @@ class MemoryModule(nn.Module):
         return alpha @ self.M
 
     # Get projection coefficients
-    def get_coefs(self, z_prime):
-        return torch.softmax(z_prime @ self.M.T, axis=1)
+    def get_coefs(self, z_prime, apply_softmax=True):
+        coef = z_prime @ self.M.T
+        if not apply_softmax:
+            return coef
+        
+        return torch.softmax(coef, axis=1)
 
     # Get convex combination of memory units
     def sample_memory(self, n):
@@ -253,7 +260,7 @@ if opt.dataset == 'MNIST':
     )
 
     # https://discuss.pytorch.org/t/how-to-use-one-class-of-number-in-mnist/26276/17
-    is_inlier = torch.tensor(dataset_train.targets) == opt.training_class
+    is_inlier = dataset_train.targets == opt.training_class
     dataset_train = torch.utils.data.dataset.Subset(dataset_train, np.where(is_inlier)[0])
     # https://discuss.pytorch.org/t/change-labels-in-data-loader/36823/9
     dataset_test.targets = list(np.where(dataset_test.targets == opt.training_class, 1, 0))
@@ -296,10 +303,10 @@ elif opt.dataset == 'CIFAR':
     )
 
     # https://discuss.pytorch.org/t/how-to-use-one-class-of-number-in-mnist/26276/17
-    is_inlier = torch.tensor(dataset_train.targets) == opt.training_class
+    is_inlier = dataset_train.targets == opt.training_class
     dataset_train = torch.utils.data.dataset.Subset(dataset_train, np.where(is_inlier)[0])
     # https://discuss.pytorch.org/t/change-labels-in-data-loader/36823/9
-    dataset_test.targets = list(np.where(torch.tensor(dataset_test.targets) == opt.training_class, 1, 0))
+    dataset_test.targets = list(np.where(dataset_test.targets == opt.training_class, 1, 0))
 
     dataloader_train = torch.utils.data.DataLoader(
         dataset_train,
@@ -319,6 +326,16 @@ optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1,
 optimizer_E = torch.optim.Adam(encoder.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_M = torch.optim.Adam(M.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+
+# scheduler_G = StepLR(optimizer_G, step_size=50, gamma=0.5)
+# scheduler_E = StepLR(optimizer_E, step_size=50, gamma=0.5)
+# scheduler_D = StepLR(optimizer_D, step_size=50, gamma=0.5)
+# scheduler_M = StepLR(optimizer_M, step_size=50, gamma=0.5)
+
+scheduler_G = StepLR(optimizer_G, step_size=50, gamma=1)
+scheduler_E = StepLR(optimizer_E, step_size=50, gamma=1)
+scheduler_D = StepLR(optimizer_D, step_size=50, gamma=1)
+scheduler_M = StepLR(optimizer_M, step_size=50, gamma=1)
 
 # For visualization
 vis_rows = 8
@@ -409,12 +426,11 @@ for epoch in range(opt.n_epochs):
         # Mutual information loss
         z_fake_recon = reparametrization(encoder(imgs_fake.detach()))
 
-        alpha_coef_recon = M.get_coefs(z_fake_recon)
-
+        alpha_coef_recon = M.get_coefs(z_fake_recon, apply_softmax=False)
         # mi_loss = torch.mean(
-        #     -torch.sum(alpha_coef * torch.log(alpha_coef_recon), dim=1)
+        #     -torch.sum(alpha_coef * torch.log((torch.softmax(alpha_coef_recon, dim=1)), dim=1)
         # )
-        mi_loss = F.cross_entropy(alpha_coef, alpha_coef_recon)
+        mi_loss = F.cross_entropy(alpha_coef_recon, alpha_coef)
 
         loss_e = loss_real + cc_loss + mp_loss + mi_loss
 
@@ -442,11 +458,11 @@ for epoch in range(opt.n_epochs):
 
         # Mutual information loss
         z_fake_recon = reparametrization(encoder(imgs_fake))
-        alpha_coef_recon = M.get_coefs(z_fake_recon)
+        alpha_coef_recon = M.get_coefs(z_fake_recon, apply_softmax=False)
         # mi_loss = torch.mean(
-        #     -torch.sum(alpha_coef * torch.log(alpha_coef_recon), dim=1)
+        #     -torch.sum(alpha_coef * torch.log((torch.softmax(alpha_coef_recon, dim=1)), dim=1)
         # )
-        mi_loss = F.cross_entropy(alpha_coef, alpha_coef_recon)
+        mi_loss = F.cross_entropy(alpha_coef_recon, alpha_coef)
 
         loss_g = loss_fake + cc_loss + mi_loss
 
@@ -473,11 +489,11 @@ for epoch in range(opt.n_epochs):
 
         # Mutual information loss
         z_fake_recon = reparametrization(encoder(imgs_fake.detach()))
-        alpha_coef_recon = M.get_coefs(z_fake_recon)
+        alpha_coef_recon = M.get_coefs(z_fake_recon, apply_softmax=False)
         # mi_loss = torch.mean(
-        #     -torch.sum(alpha_coef * torch.log(alpha_coef_recon), dim=1)
+        #     -torch.sum(alpha_coef * torch.log((torch.softmax(alpha_coef_recon, dim=1)), dim=1)
         # )
-        mi_loss = F.cross_entropy(alpha_coef, alpha_coef_recon)
+        mi_loss = F.cross_entropy(alpha_coef_recon, alpha_coef)
 
         optimizer_M.zero_grad()
 
@@ -497,7 +513,7 @@ for epoch in range(opt.n_epochs):
             with torch.no_grad():
                 gen_examples = generator(vis_noise).detach().cpu()
                 save_image(gen_examples, 
-                    os.path.join(IMAGE_DIR, f'{epoch+1}.png'),
+                    os.path.join(IMAGE_DIR, 'RANDOM_SAMPLES', f'{epoch+1}.png'),
                     nrow=vis_rows, normalize=True)
                 
                 z_mem_sample_vis, _ = M.sample_memory(vis_rows ** 2)
@@ -515,6 +531,11 @@ for epoch in range(opt.n_epochs):
     for metric,val_packed in kbar._values.items():
         value_sum, count = val_packed
         writer.add_scalar(metric, value_sum / count, epoch)
+    
+    scheduler_G.step()
+    scheduler_E.step()
+    scheduler_D.step()
+    scheduler_M.step()
     
     writer.flush()
 
