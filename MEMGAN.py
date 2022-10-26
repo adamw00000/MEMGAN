@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils
 
+from spectral import SpectralNorm
+
 from tensorboardX import SummaryWriter
 
 opt = argparse.Namespace(
@@ -35,11 +37,11 @@ opt = argparse.Namespace(
     dim_memory=256,
     # sample_interval=400,
     training_class=3,
-    dataset='CIFAR',
-    # dataset='MNIST',
+    # dataset='CIFAR',
+    dataset='MNIST',
 )
 
-IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v4"
+IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v7"
 
 os.makedirs(IMAGE_DIR, exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'RANDOM_SAMPLES'), exist_ok=True)
@@ -57,16 +59,16 @@ if opt.dataset == 'MNIST':
     opt.img_size = 28
     opt.channels = 1
     opt.n_memory = 50
-    opt.dim_memory = 64
+    opt.dim_memory = opt.latent_dim = 64
 
 
-def weights_init_normal(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
+# def weights_init_normal(m):
+#     classname = m.__class__.__name__
+#     if classname.find('Conv') != -1:
+#         nn.init.normal_(m.weight.data, 0.0, 0.02)
+#     elif classname.find('BatchNorm') != -1:
+#         nn.init.normal_(m.weight.data, 1.0, 0.02)
+#         nn.init.constant_(m.bias.data, 0)
 
 
 def reparametrization(encoder_out):
@@ -80,6 +82,45 @@ def get_log_odds(raw_marginals):
     return torch.log(marginals / (1 - marginals))
 
 
+class Self_Attn(nn.Module):
+    """ Self attention Layer"""
+    def __init__(self, in_dim):
+        super().__init__()
+        
+        # Construct the conv layers
+        self.query_conv = nn.Conv2d(in_channels = in_dim , out_channels = in_dim//2 , kernel_size= 1)
+        self.key_conv = nn.Conv2d(in_channels = in_dim , out_channels = in_dim//2 , kernel_size= 1)
+        self.value_conv = nn.Conv2d(in_channels = in_dim , out_channels = in_dim , kernel_size= 1)
+        
+        # Initialize gamma as 0
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax  = nn.Softmax(dim=-1)
+        
+    def forward(self,x):
+        """
+            inputs :
+                x : input feature maps( B * C * W * H)
+            returns :
+                out : self attention value + input feature 
+                attention: B * N * N (N is Width*Height)
+        """
+        m_batchsize,C,width ,height = x.size()
+        
+        proj_query  = self.query_conv(x).view(m_batchsize, -1, width*height).permute(0,2,1) # B * N * C
+        proj_key =  self.key_conv(x).view(m_batchsize, -1, width*height) # B * C * N
+        energy =  torch.bmm(proj_query, proj_key) # batch matrix-matrix product
+        
+        attention = self.softmax(energy) # B * N * N
+        proj_value = self.value_conv(x).view(m_batchsize, -1, width*height) # B * C * N
+        out = torch.bmm(proj_value, attention.permute(0,2,1)) # batch matrix-matrix product
+        out = out.view(m_batchsize,C,width,height) # B * C * W * H
+        
+        # Add attention weights onto input
+        out = self.gamma*out + x
+        # return out, attention
+        return out
+
+
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
@@ -87,7 +128,9 @@ class Generator(nn.Module):
         def generator_block(in_filters, out_filters, kernel_size=4, stride=2, padding=1,
                 bn_eps=1e-5, bias=False):
             block = [
-                nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias), 
+                SpectralNorm(
+                    nn.ConvTranspose2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias)
+                ), 
                 nn.BatchNorm2d(out_filters, bn_eps),
                 nn.ReLU(inplace=True), 
             ]
@@ -101,19 +144,20 @@ class Generator(nn.Module):
                 *generator_block(ngf * 8, ngf * 4, 4, 1, 0, bias=False),
                 *generator_block(ngf * 4, ngf * 2, 3, 2, 1, bias=False),
                 *generator_block(ngf * 2, ngf * 1, 4, 2, 1, bias=False),
+                Self_Attn(ngf * 1),
                 nn.ConvTranspose2d(ngf, opt.channels, 4, 2, 1, bias=False),
                 nn.Tanh(),
             )
-        elif opt.dataset == 'CIFAR':
-            self.conv_blocks = nn.Sequential(
-                *generator_block(opt.latent_dim, ngf * 16, 1, 1, 0, bias=False),
-                *generator_block(ngf * 16, ngf * 8, 4, 1, 0, bias=False),
-                *generator_block(ngf * 8, ngf * 4, 4, 2, 0, bias=False),
-                *generator_block(ngf * 4, ngf * 2, 4, 1, 0, bias=False),
-                *generator_block(ngf * 2, ngf * 1, 4, 2, 0, bias=False),
-                nn.ConvTranspose2d(ngf, opt.channels, 5, 1, 0, bias=False),
-                nn.Tanh(),
-            )
+        # elif opt.dataset == 'CIFAR':
+        #     self.conv_blocks = nn.Sequential(
+        #         *generator_block(opt.latent_dim, ngf * 16, 1, 1, 0, bias=False),
+        #         *generator_block(ngf * 16, ngf * 8, 4, 1, 0, bias=False),
+        #         *generator_block(ngf * 8, ngf * 4, 4, 2, 0, bias=False),
+        #         *generator_block(ngf * 4, ngf * 2, 4, 1, 0, bias=False),
+        #         *generator_block(ngf * 2, ngf * 1, 4, 2, 0, bias=False),
+        #         nn.ConvTranspose2d(ngf, opt.channels, 5, 1, 0, bias=False),
+        #         nn.Tanh(),
+        #     )
 
     def forward(self, z):
         img = self.conv_blocks(z.view(*z.shape, 1, 1))
@@ -127,43 +171,44 @@ class Encoder(nn.Module):
         def encoder_block(in_filters, out_filters, kernel_size=4, stride=2, padding=1,
                 relu_slope=0.1, bn_eps=1e-5):
             block = [
-                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=False), 
-                nn.BatchNorm2d(out_filters, bn_eps),
+                SpectralNorm(
+                    nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=False)
+                ), 
+                # nn.BatchNorm2d(out_filters, bn_eps),
                 nn.LeakyReLU(relu_slope, inplace=True), 
             ]
             return block
 
         nef = 32
 
+                # *discriminator_block(opt.channels, ndf, 4, 2, 1),
+                # *discriminator_block(ndf * 1, ndf * 2, 4, 2, 1),
+                # *discriminator_block(ndf * 2, ndf * 4, 4, 2, 1),
+                # Self_Attn(ndf * 2),
+                # *discriminator_block(ndf * 4, ndf * 8, 4, 2, 1),
         if opt.dataset == 'MNIST':
             self.model = nn.Sequential(
                 *encoder_block(opt.channels, nef, 4, 2, 1),
                 *encoder_block(nef * 1, nef * 2, 4, 2, 1),
                 *encoder_block(nef * 2, nef * 4, 3, 2, 1),
+                Self_Attn(nef * 4),
                 *encoder_block(nef * 4, nef * 8, 4, 1, 0),
                 # 2 * latent = (mu, sigma)
                 nn.Conv2d(nef * 8, 2 * opt.latent_dim, 1, 1, 0, bias=True),
                 nn.Flatten()
             )
-        elif opt.dataset == 'CIFAR':
-            self.model = nn.Sequential(
-                *encoder_block(opt.channels, nef, 5, 1, 0),
-                *encoder_block(nef * 1, nef * 2, 4, 2, 0),
-                *encoder_block(nef * 2, nef * 4, 4, 1, 0),
-                *encoder_block(nef * 4, nef * 8, 4, 2, 0),
-                *encoder_block(nef * 8, nef * 16, 4, 1, 0),
-                *encoder_block(nef * 16, nef * 16, 1, 1, 0),
-                # 2 * latent = (mu, sigma)
-                nn.Conv2d(nef * 16, 2 * opt.latent_dim, 1, 1, 0, bias=True),
-                nn.Flatten()
-            )
-            
-            # *encoder_block(opt.channels, 32, kernel_size=5, stride=1),
-            # *encoder_block(32, 64, kernel_size=4, stride=2),
-            # *encoder_block(64, 128, kernel_size=4, stride=1),
-            # *encoder_block(128, 256, kernel_size=4, stride=2),
-            # *encoder_block(256, 512, kernel_size=4, stride=1),
-            # *encoder_block(512, 512, kernel_size=1, stride=1),
+        # elif opt.dataset == 'CIFAR':
+        #     self.model = nn.Sequential(
+        #         *encoder_block(opt.channels, nef, 5, 1, 0),
+        #         *encoder_block(nef * 1, nef * 2, 4, 2, 0),
+        #         *encoder_block(nef * 2, nef * 4, 4, 1, 0),
+        #         *encoder_block(nef * 4, nef * 8, 4, 2, 0),
+        #         *encoder_block(nef * 8, nef * 16, 4, 1, 0),
+        #         *encoder_block(nef * 16, nef * 16, 1, 1, 0),
+        #         # 2 * latent = (mu, sigma)
+        #         nn.Conv2d(nef * 16, 2 * opt.latent_dim, 1, 1, 0, bias=True),
+        #         nn.Flatten()
+        #     )
 
     def forward(self, x):
         out = self.model(x)
@@ -177,12 +222,14 @@ class DiscriminatorXZ(nn.Module):
         def discriminator_block(in_filters, out_filters, kernel_size=4, stride=2, padding=1, bias=False,
                 bn=True, dropout=0.3, relu_slope=0.1, bn_eps=1e-5):
             block = [
-                nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias), 
+                SpectralNorm(
+                    nn.Conv2d(in_filters, out_filters, kernel_size, stride, padding, bias=bias)
+                ), 
                 nn.LeakyReLU(relu_slope, inplace=True), 
-                nn.Dropout2d(dropout)
+                # nn.Dropout2d(dropout)
             ]
-            if bn:
-                block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
+            # if bn:
+            #     block.insert(1, nn.BatchNorm2d(out_filters, bn_eps))
             return block
 
         ndf = 32
@@ -192,11 +239,12 @@ class DiscriminatorXZ(nn.Module):
                 *discriminator_block(opt.channels, ndf, 4, 2, 1, bn=False),
                 *discriminator_block(ndf * 1, ndf * 2, 4, 2, 1),
                 *discriminator_block(ndf * 2, ndf * 4, 3, 2, 1),
+                Self_Attn(ndf * 4),
                 *discriminator_block(ndf * 4, ndf * 8, 4, 1, 0),
             )
             self.z_block = nn.Sequential(
                 *discriminator_block(opt.latent_dim, ndf * 8, 1, 1, 0, dropout=0.2, bn=False),
-                *discriminator_block(ndf * 8, ndf * 8, 1, 1, 0, dropout=0.5, bn=False),
+                # *discriminator_block(ndf * 8, ndf * 8, 1, 1, 0, dropout=0.5, bn=False),
             )
             self.joint_block = nn.Sequential(
                 # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
@@ -209,30 +257,30 @@ class DiscriminatorXZ(nn.Module):
                 nn.Sigmoid(),
                 nn.Flatten()
             )
-        elif opt.dataset == 'CIFAR':
-            self.x_block = nn.Sequential(
-                *discriminator_block(opt.channels, ndf, 5, 1, 0),
-                *discriminator_block(ndf * 1, ndf * 2, 4, 2, 0),
-                *discriminator_block(ndf * 2, ndf * 4, 4, 1, 0),
-                *discriminator_block(ndf * 4, ndf * 8, 4, 2, 0),
-                *discriminator_block(ndf * 8, ndf * 16, 4, 1, 0),
-                *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0),
-            )
-            self.z_block = nn.Sequential(
-                *discriminator_block(opt.latent_dim, ndf * 16, 1, 1, 0, dropout=0.2, bn=False),
-                *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False),
-            )
-            self.joint_block = nn.Sequential(
-                # *discriminator_block(ndf * 32, ndf * 32, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-                # *discriminator_block(ndf * 32, ndf * 32, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-            )
-            self.adv_layer = nn.Sequential(
-                # nn.Linear(1024, 1),
-                # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
-                *discriminator_block(ndf * 32, 1, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-                nn.Sigmoid(),
-                nn.Flatten()
-            )
+        # elif opt.dataset == 'CIFAR':
+        #     self.x_block = nn.Sequential(
+        #         *discriminator_block(opt.channels, ndf, 5, 1, 0),
+        #         *discriminator_block(ndf * 1, ndf * 2, 4, 2, 0),
+        #         *discriminator_block(ndf * 2, ndf * 4, 4, 1, 0),
+        #         *discriminator_block(ndf * 4, ndf * 8, 4, 2, 0),
+        #         *discriminator_block(ndf * 8, ndf * 16, 4, 1, 0),
+        #         *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0),
+        #     )
+        #     self.z_block = nn.Sequential(
+        #         *discriminator_block(opt.latent_dim, ndf * 16, 1, 1, 0, dropout=0.2, bn=False),
+        #         *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False),
+        #     )
+        #     self.joint_block = nn.Sequential(
+        #         # *discriminator_block(ndf * 32, ndf * 32, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+        #         # *discriminator_block(ndf * 32, ndf * 32, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+        #     )
+        #     self.adv_layer = nn.Sequential(
+        #         # nn.Linear(1024, 1),
+        #         # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
+        #         *discriminator_block(ndf * 32, 1, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+        #         nn.Sigmoid(),
+        #         nn.Flatten()
+        #     )
 
     def forward(self, x, z):
         x_repr = self.x_block(x)
@@ -288,9 +336,9 @@ adversarial_loss.to(device)
 M.to(device)
 
 # Initialize weights
-generator.apply(weights_init_normal)
-encoder.apply(weights_init_normal)
-discriminator.apply(weights_init_normal)
+# generator.apply(weights_init_normal)
+# encoder.apply(weights_init_normal)
+# discriminator.apply(weights_init_normal)
 
 # Configure data loader
 if opt.dataset == 'MNIST':
@@ -681,7 +729,7 @@ for epoch in range(opt.n_epochs):
         plt.figure(figsize=(8, 10))
         sns.histplot(df, x='Score', hue='Class', hue_order=['Outlier', 'Inlier'])
         plt.savefig(os.path.join(IMAGE_DIR, 'TEST_HISTOGRAMS', f'{epoch+1}.png'))
-
+        plt.close()
 
     generator.train()
     encoder.train()
