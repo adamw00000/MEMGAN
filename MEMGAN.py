@@ -28,24 +28,25 @@ opt = argparse.Namespace(
     b1=0.5,
     b2=0.999,
     n_cpu=8,
-    latent_dim=64, # should be == dim_memory
+    latent_dim=256, # should be == dim_memory
     img_size=32,
     channels=3,
     n_memory=100,
-    dim_memory=64,
+    dim_memory=256,
     # sample_interval=400,
     training_class=3,
-    # dataset='CIFAR',
-    dataset='MNIST',
+    dataset='CIFAR',
+    # dataset='MNIST',
 )
 
-IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v5"
+IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v4"
 
 os.makedirs(IMAGE_DIR, exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'RANDOM_SAMPLES'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'MEMORY_GEN_SAMPLES'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'MEMORY_VIS'), exist_ok=True)
 os.makedirs(os.path.join(IMAGE_DIR, 'TEST_RECONS'), exist_ok=True)
+os.makedirs(os.path.join(IMAGE_DIR, 'TEST_HISTOGRAMS'), exist_ok=True)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 current_time = datetime.now().strftime('%b%d_%H-%M-%S')
@@ -53,8 +54,10 @@ logdir = os.path.join('runs', opt.dataset, current_time)
 writer = SummaryWriter(logdir)
 
 if opt.dataset == 'MNIST':
-    opt.channels = 1
     opt.img_size = 28
+    opt.channels = 1
+    opt.n_memory = 50
+    opt.dim_memory = 64
 
 
 def weights_init_normal(m):
@@ -92,14 +95,25 @@ class Generator(nn.Module):
 
         ngf = 32
         
-        self.conv_blocks = nn.Sequential(
-            *generator_block(opt.latent_dim, ngf * 8, 1, 1, 0, bias=False),
-            *generator_block(ngf * 8, ngf * 4, 4, 1, 0, bias=False),
-            *generator_block(ngf * 4, ngf * 2, 3, 2, 1, bias=False),
-            *generator_block(ngf * 2, ngf * 1, 4, 2, 1, bias=False),
-            nn.ConvTranspose2d(ngf, opt.channels, 4, 2, 1, bias=False),
-            nn.Tanh(),
-        )
+        if opt.dataset == 'MNIST':
+            self.conv_blocks = nn.Sequential(
+                *generator_block(opt.latent_dim, ngf * 8, 1, 1, 0, bias=False),
+                *generator_block(ngf * 8, ngf * 4, 4, 1, 0, bias=False),
+                *generator_block(ngf * 4, ngf * 2, 3, 2, 1, bias=False),
+                *generator_block(ngf * 2, ngf * 1, 4, 2, 1, bias=False),
+                nn.ConvTranspose2d(ngf, opt.channels, 4, 2, 1, bias=False),
+                nn.Tanh(),
+            )
+        elif opt.dataset == 'CIFAR':
+            self.conv_blocks = nn.Sequential(
+                *generator_block(opt.latent_dim, ngf * 16, 1, 1, 0, bias=False),
+                *generator_block(ngf * 16, ngf * 8, 4, 1, 0, bias=False),
+                *generator_block(ngf * 8, ngf * 4, 4, 2, 0, bias=False),
+                *generator_block(ngf * 4, ngf * 2, 4, 1, 0, bias=False),
+                *generator_block(ngf * 2, ngf * 1, 4, 2, 0, bias=False),
+                nn.ConvTranspose2d(ngf, opt.channels, 5, 1, 0, bias=False),
+                nn.Tanh(),
+            )
 
     def forward(self, z):
         img = self.conv_blocks(z.view(*z.shape, 1, 1))
@@ -121,15 +135,35 @@ class Encoder(nn.Module):
 
         nef = 32
 
-        self.model = nn.Sequential(
-            *encoder_block(opt.channels, nef, 4, 2, 1),
-            *encoder_block(nef * 1, nef * 2, 4, 2, 1),
-            *encoder_block(nef * 2, nef * 4, 3, 2, 1),
-            *encoder_block(nef * 4, nef * 8, 4, 1, 0),
-            # 2 * latent = (mu, sigma)
-            nn.Conv2d(nef * 8, 2 * opt.latent_dim, 1, 1, 0, bias=True),
-            nn.Flatten()
-        )
+        if opt.dataset == 'MNIST':
+            self.model = nn.Sequential(
+                *encoder_block(opt.channels, nef, 4, 2, 1),
+                *encoder_block(nef * 1, nef * 2, 4, 2, 1),
+                *encoder_block(nef * 2, nef * 4, 3, 2, 1),
+                *encoder_block(nef * 4, nef * 8, 4, 1, 0),
+                # 2 * latent = (mu, sigma)
+                nn.Conv2d(nef * 8, 2 * opt.latent_dim, 1, 1, 0, bias=True),
+                nn.Flatten()
+            )
+        elif opt.dataset == 'CIFAR':
+            self.model = nn.Sequential(
+                *encoder_block(opt.channels, nef, 5, 1, 0),
+                *encoder_block(nef * 1, nef * 2, 4, 2, 0),
+                *encoder_block(nef * 2, nef * 4, 4, 1, 0),
+                *encoder_block(nef * 4, nef * 8, 4, 2, 0),
+                *encoder_block(nef * 8, nef * 16, 4, 1, 0),
+                *encoder_block(nef * 16, nef * 16, 1, 1, 0),
+                # 2 * latent = (mu, sigma)
+                nn.Conv2d(nef * 16, 2 * opt.latent_dim, 1, 1, 0, bias=True),
+                nn.Flatten()
+            )
+            
+            # *encoder_block(opt.channels, 32, kernel_size=5, stride=1),
+            # *encoder_block(32, 64, kernel_size=4, stride=2),
+            # *encoder_block(64, 128, kernel_size=4, stride=1),
+            # *encoder_block(128, 256, kernel_size=4, stride=2),
+            # *encoder_block(256, 512, kernel_size=4, stride=1),
+            # *encoder_block(512, 512, kernel_size=1, stride=1),
 
     def forward(self, x):
         out = self.model(x)
@@ -153,27 +187,52 @@ class DiscriminatorXZ(nn.Module):
 
         ndf = 32
 
-        self.x_block = nn.Sequential(
-            *discriminator_block(opt.channels, ndf, 4, 2, 1, bn=False),
-            *discriminator_block(ndf * 1, ndf * 2, 4, 2, 1),
-            *discriminator_block(ndf * 2, ndf * 4, 3, 2, 1),
-            *discriminator_block(ndf * 4, ndf * 8, 4, 1, 0),
-        )
-        self.z_block = nn.Sequential(
-            *discriminator_block(opt.latent_dim, ndf * 8, 1, 1, 0, dropout=0.2, bn=False),
-            *discriminator_block(ndf * 8, ndf * 8, 1, 1, 0, dropout=0.5, bn=False),
-        )
-        self.joint_block = nn.Sequential(
-            # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-            # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-        )
-        self.adv_layer = nn.Sequential(
-            # nn.Linear(1024, 1),
-            # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
-            *discriminator_block(ndf * 16, 1, 1, 1, 0, dropout=0.5, bn=False, bias=True),
-            nn.Sigmoid(),
-            nn.Flatten()
-        )
+        if opt.dataset == 'MNIST':
+            self.x_block = nn.Sequential(
+                *discriminator_block(opt.channels, ndf, 4, 2, 1, bn=False),
+                *discriminator_block(ndf * 1, ndf * 2, 4, 2, 1),
+                *discriminator_block(ndf * 2, ndf * 4, 3, 2, 1),
+                *discriminator_block(ndf * 4, ndf * 8, 4, 1, 0),
+            )
+            self.z_block = nn.Sequential(
+                *discriminator_block(opt.latent_dim, ndf * 8, 1, 1, 0, dropout=0.2, bn=False),
+                *discriminator_block(ndf * 8, ndf * 8, 1, 1, 0, dropout=0.5, bn=False),
+            )
+            self.joint_block = nn.Sequential(
+                # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+                # *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+            )
+            self.adv_layer = nn.Sequential(
+                # nn.Linear(1024, 1),
+                # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
+                *discriminator_block(ndf * 16, 1, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+                nn.Sigmoid(),
+                nn.Flatten()
+            )
+        elif opt.dataset == 'CIFAR':
+            self.x_block = nn.Sequential(
+                *discriminator_block(opt.channels, ndf, 5, 1, 0),
+                *discriminator_block(ndf * 1, ndf * 2, 4, 2, 0),
+                *discriminator_block(ndf * 2, ndf * 4, 4, 1, 0),
+                *discriminator_block(ndf * 4, ndf * 8, 4, 2, 0),
+                *discriminator_block(ndf * 8, ndf * 16, 4, 1, 0),
+                *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0),
+            )
+            self.z_block = nn.Sequential(
+                *discriminator_block(opt.latent_dim, ndf * 16, 1, 1, 0, dropout=0.2, bn=False),
+                *discriminator_block(ndf * 16, ndf * 16, 1, 1, 0, dropout=0.5, bn=False),
+            )
+            self.joint_block = nn.Sequential(
+                # *discriminator_block(ndf * 32, ndf * 32, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+                # *discriminator_block(ndf * 32, ndf * 32, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+            )
+            self.adv_layer = nn.Sequential(
+                # nn.Linear(1024, 1),
+                # nn.Conv2d(512, 1, 1, stride=1, bias=True), 
+                *discriminator_block(ndf * 32, 1, 1, 1, 0, dropout=0.5, bn=False, bias=True),
+                nn.Sigmoid(),
+                nn.Flatten()
+            )
 
     def forward(self, x, z):
         x_repr = self.x_block(x)
@@ -305,10 +364,10 @@ elif opt.dataset == 'CIFAR':
     )
 
     # https://discuss.pytorch.org/t/how-to-use-one-class-of-number-in-mnist/26276/17
-    is_inlier = dataset_train.targets == opt.training_class
+    is_inlier = torch.tensor(dataset_train.targets) == opt.training_class
     dataset_train = torch.utils.data.dataset.Subset(dataset_train, np.where(is_inlier)[0])
     # https://discuss.pytorch.org/t/change-labels-in-data-loader/36823/9
-    dataset_test.targets = list(np.where(dataset_test.targets == opt.training_class, 1, 0))
+    dataset_test.targets = list(np.where(torch.tensor(dataset_test.targets) == opt.training_class, 1, 0))
 
     dataloader_train = torch.utils.data.DataLoader(
         dataset_train,
@@ -565,6 +624,38 @@ for epoch in range(opt.n_epochs):
         pred_scores = torch.cat(pred_scores).cpu().numpy()
         true_labels = torch.cat(true_labels).cpu().numpy()
 
+        # # THRESHOLDING IDEAS
+
+        # threshold = np.quantile(-pred_scores, 1 - np.mean(true_labels))
+        # pred_labels = np.where(-pred_scores < threshold, 0, 1)
+
+        # pre = metrics.precision_score(true_labels, pred_labels)
+        # rec = metrics.recall_score(true_labels, pred_labels)
+        # f1 = metrics.f1_score(true_labels, pred_labels)
+
+        # # from sklearn.cluster import SpectralClustering
+        # # cluster = SpectralClustering(2)
+        # # cluster_assignment = cluster.fit_predict(pred_scores.reshape(-1, 1))
+        # # cluster_assignment
+        # from sklearn.cluster import KMeans
+        # cluster = KMeans(2, init=np.r_[cc_loss.detach().cpu().numpy(), np.mean(pred_scores)].reshape(-1, 1))
+        # cluster_assignment = cluster.fit_predict(pred_scores.reshape(-1, 1))
+        # cluster_assignment
+
+        # cluster_0_mean = np.mean(pred_scores[cluster_assignment == 0])
+        # cluster_1_mean = np.mean(pred_scores[cluster_assignment == 1])
+        
+        # outlier_cluster = 0
+        # if cluster_1_mean > cluster_0_mean:
+        #     outlier_cluster = 1
+        
+        # pred_labels = np.where(cluster_assignment == outlier_cluster, 0, 1)
+        # pre = metrics.precision_score(true_labels, pred_labels)
+        # rec = metrics.recall_score(true_labels, pred_labels)
+        # f1 = metrics.f1_score(true_labels, pred_labels)
+
+        # # THRESHOLDING IDEAS END
+
         auc = metrics.roc_auc_score(true_labels, -pred_scores)
 
         inliers = np.where(true_labels == 1)[0]
@@ -575,6 +666,22 @@ for epoch in range(opt.n_epochs):
         mean_outlier_score = np.mean(pred_scores[~inliers_mask])
 
         kbar.add(1, values=[("AUC", auc), ("A(IN)", mean_inlier_score), ("A(OUT)", mean_outlier_score)])
+        
+        # PLOTTING
+
+        import pandas as pd
+        df = pd.DataFrame({
+            'Score': pred_scores,
+            'Placeholder': np.array('' * len(pred_scores)),
+            'Class': np.where(true_labels == 0, 'Outlier', 'Inlier'),
+        })
+
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        plt.figure(figsize=(8, 10))
+        sns.histplot(df, x='Score', hue='Class', hue_order=['Outlier', 'Inlier'])
+        plt.savefig(os.path.join(IMAGE_DIR, 'TEST_HISTOGRAMS', f'{epoch+1}.png'))
+
 
     generator.train()
     encoder.train()
