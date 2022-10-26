@@ -34,9 +34,11 @@ opt = argparse.Namespace(
     n_memory=100,
     dim_memory=256,
     # sample_interval=400,
-    training_class=3,
-    dataset='CIFAR',
-    # dataset='MNIST',
+    training_class=0,
+    # CIFAR settings above
+    
+    # dataset='CIFAR',
+    dataset='MNIST',
 )
 
 IMAGE_DIR = f"images_MEMGAN_{opt.dataset}_v4"
@@ -57,7 +59,8 @@ if opt.dataset == 'MNIST':
     opt.img_size = 28
     opt.channels = 1
     opt.n_memory = 50
-    opt.dim_memory = 64
+    opt.dim_memory = opt.latent_dim = 64
+    opt.training_class = 3
 
 
 def weights_init_normal(m):
@@ -681,7 +684,7 @@ for epoch in range(opt.n_epochs):
         plt.figure(figsize=(8, 10))
         sns.histplot(df, x='Score', hue='Class', hue_order=['Outlier', 'Inlier'])
         plt.savefig(os.path.join(IMAGE_DIR, 'TEST_HISTOGRAMS', f'{epoch+1}.png'))
-
+        plt.close()
 
     generator.train()
     encoder.train()
